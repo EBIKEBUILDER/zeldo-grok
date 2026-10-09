@@ -48,6 +48,8 @@ export interface Enemy {
   y: number;
   vx: number;
   vy: number;
+  /** body yaw (view convention: atan2(dx, -dy)); follows velocity, or the hero only while attacking */
+  face: number;
   /** the map the enemy spawns on / walks back to (it may follow the hero through a portal) */
   homeMap: MapId;
   homeX: number;

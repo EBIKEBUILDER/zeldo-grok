@@ -64,6 +64,7 @@ You start in **Hearthollow**, a safe village with a cottage and a well. A small 
   - Bodies separate at hero radius + enemy radius (0.72 for blobs). Blobs hit out to 0.90, so a visibly touching blob always connects. The Warden keeps his 0.08 margin.
   - When several enemies are touching you and off cooldown, the one that has waited longest lands the hit, so every adjacent blob gets a turn.
 - **Spawn bubble (anti-AFK):** radius 2.5 around the spawn point. Enemies never enter it, never aggro on or touch you inside it, and chasers break off the moment you step in. A couple of steps leave it. Every enemy starts at least 11 tiles from spawn (aggro range 5.5 + bubble 2.5 + margin), so a fresh spawn is never swarmed.
+- **Facing:** the sim owns each enemy's facing (`face`) and turns it smoothly at a capped rate. An enemy looks at you only while aggro'd and closing in, brawling or attacking (the Warden also while awake and aiming his lunge). Otherwise it faces its actual velocity, so a blob walking home on its A* route turns around instead of moonwalking. While knocked back or stunned it keeps facing the attacker.
 - **The Warden** (1.6 tiles wide) pushes field waypoints away from walls so it uses 2-tile corridors instead of grinding into pillars.
 
 ## Boss telegraphs

@@ -1,9 +1,9 @@
 import { afterEach, describe, expect, it } from "vitest";
-import { contactRange, gateClosed, playerField, stepGame } from "@/game/sim";
+import { boxHitsSolid, contactRange, gateClosed, playerField, stepGame, yawOf } from "@/game/sim";
 import { NAV_MAX_REQUESTS_PER_TICK, NAV_TICK_NODES, fieldAt } from "@/game/path";
 import { navGrid, navStats } from "@/game/nav";
 import { BLOB_GIVEUP, CONTACT_COOLDOWN, SAFE_RADIUS, SCREEN_H, SCREEN_W } from "@/game/constants";
-import { GATE_ROW, GATE_X, MAPS, OVER_DOOR, PORTALS, SPAWN, isSolidTile, tileAt } from "@/game/world";
+import { GATE_ROW, GATE_X, MAPS, OVER_DOOR, PORTALS, SPAWN, Tile, isSolidTile, tileAt } from "@/game/world";
 import type { Enemy, GameState } from "@/game/types";
 import { fresh, idle, run } from "./helpers";
 
@@ -338,5 +338,93 @@ describe("contact damage", () => {
     const hp = s.player.hp;
     run(s, {}, 60 * 10);
     expect(s.player.hp).toBe(hp);
+  });
+});
+
+describe("returning home", () => {
+  const angDiff = (a: number, b: number) => {
+    let d = a - b;
+    while (d > Math.PI) d -= Math.PI * 2;
+    while (d < -Math.PI) d += Math.PI * 2;
+    return Math.abs(d);
+  };
+  /** a hedge tile on the y=12 divider with open ground on both sides and a real detour */
+  function hedgeSpot(s: GameState): number {
+    for (let x = 2; x < 46; x++) {
+      if (tileAt(MAPS.over, x, 12) === Tile.HEDGE && !isSolidTile(tileAt(MAPS.over, x, 11), true) && !isSolidTile(tileAt(MAPS.over, x, 13), true) && Math.hypot(x + 0.5 - SPAWN.x, 13.5 - SPAWN.y) > 9) {
+        s.player.x = x + 0.5; s.player.y = 13.5; s.tick += 10;
+        const fd = fieldAt(playerField(s, "over").field, x, 11);
+        if (fd > 4 && fd < 14) return x;
+      }
+    }
+    throw new Error("no hedge spot");
+  }
+
+  it("walks home on a pathfound route around a hedge (never into it), facing where it walks", () => {
+    const s = fresh();
+    const e = blobs(s)[0];
+    only(s, [e]);
+    const x = hedgeSpot(s);
+    // home is just across the hedge; the hero is far away so it won't re-aggro
+    e.homeX = x + 0.5; e.homeY = 13.5;
+    e.x = x + 0.5; e.y = 11.5; e.vx = e.vy = 0;
+    s.player.x = SPAWN.x; s.player.y = SPAWN.y;
+    chase(e);
+    e.stuckT = 99; // give up now
+    let home = false, checked = 0, aligned = 0, pathLen = 0, sawPath = false;
+    let px = e.x, py = e.y;
+    for (let i = 0; i < 60 * 15 && !home; i++) {
+      stepGame(s, idle());
+      if (e.path.length > 0) sawPath = true;
+      pathLen += Math.hypot(e.x - px, e.y - py);
+      px = e.x; py = e.y;
+      expect(boxHitsSolid(s, "over", e.x, e.y, e.r * 0.85)).toBe(false);
+      const sp = Math.hypot(e.vx, e.vy);
+      if (e.state === "return" && sp > 0.8) {
+        checked++;
+        if (angDiff(e.face, yawOf(e.vx, e.vy)) < 0.35) aligned++;
+      }
+      home = e.state !== "return" && Math.hypot(e.x - e.homeX, e.y - e.homeY) < 0.5;
+    }
+    expect(home).toBe(true);
+    expect(sawPath).toBe(true);
+    expect(pathLen).toBeGreaterThan(4); // went around, not through (straight line is 2 tiles)
+    // facing tracks the actual walking direction (allowing for the turn at corners)
+    expect(checked).toBeGreaterThan(60);
+    expect(aligned / checked).toBeGreaterThan(0.85);
+  });
+
+  it("never moonwalks: walking away from the hero it faces away from them", () => {
+    const s = fresh();
+    const e = blobs(s)[0];
+    only(s, [e]);
+    const [x, y] = openSpot();
+    clearPots(s, x, y, 5);
+    place(e, x, y);
+    e.x = x + 2.5; // 2.5 tiles from home
+    s.player.x = x + 4.5; s.player.y = y; s.player.invuln = 1e9;
+    e.face = yawOf(1, 0); // was staring at the hero
+    chase(e);
+    e.stuckT = 99;
+    let late = 0, backwards = 0;
+    for (let i = 0; i < 60 * 2; i++) {
+      stepGame(s, idle());
+      if (e.state !== "return" || Math.hypot(e.vx, e.vy) < 0.8) continue;
+      if (i > 20) {
+        late++;
+        if (angDiff(e.face, yawOf(s.player.x - e.x, s.player.y - e.y)) < Math.PI / 2) backwards++;
+      }
+    }
+    expect(late).toBeGreaterThan(10);
+    expect(backwards).toBe(0);
+  });
+
+  it("knockback keeps facing the attacker; idle keeps its facing", () => {
+    const s = fresh();
+    const e = blobs(s)[0];
+    only(s, [e]);
+    e.face = 1.0; e.stun = 0.5; e.vx = -6; e.vy = 0;
+    run(s, {}, 10);
+    expect(e.face).toBeCloseTo(1.0, 6);
   });
 });

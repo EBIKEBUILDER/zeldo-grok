@@ -1235,12 +1235,11 @@ export class GameView {
       v.spawnT = Math.min(1, v.spawnT + dt * 3);
       const pos = toWorld(e.map, e.x, e.y, 0, this.tmpV);
       v.root.position.copyFrom(pos);
-      const p = state.player;
-      const look = Math.atan2(p.x - e.x, -(p.y - e.y));
-      let d = look - v.yaw;
+      // facing comes from the sim (velocity, or the hero only while attacking); just smooth frames
+      let d = e.face - v.yaw;
       while (d > Math.PI) d -= Math.PI * 2;
       while (d < -Math.PI) d += Math.PI * 2;
-      v.yaw += d * Math.min(1, dt * (e.state === "chase" ? 8 : 2));
+      v.yaw += d * Math.min(1, dt * 20);
       v.mesh.rotation.y = v.yaw;
       // squash & stretch
       const rate = e.state === "chase" || e.state === "lunge" ? 11 : 5;

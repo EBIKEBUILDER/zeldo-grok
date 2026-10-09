@@ -59,6 +59,7 @@ export function createInitialState(seed = 12345): GameState {
       vx: 0,
       vy: 0,
       homeMap: s.map,
+      face: Math.PI, // toward the camera
       homeX: s.x,
       homeY: s.y,
       r: boss ? C.BOSS_R : C.BLOB_R,
@@ -990,6 +991,7 @@ function updateEnemies(s: GameState, dt: number) {
     const samePlace = e.map === p.map;
     const dx = p.x - e.x, dy = p.y - e.y;
     const d = len(dx, dy);
+    updateFacing(s, e, dt, samePlace, d);
 
     if (e.stun > 0) {
       e.stun -= dt;
@@ -1039,6 +1041,41 @@ function updateEnemies(s: GameState, dt: number) {
     }
   }
   serveNavQueue(s);
+}
+
+/** Yaw for a map-space direction, in the view's convention (map y runs toward the camera). */
+export function yawOf(dx: number, dy: number): number {
+  return Math.atan2(dx, -dy);
+}
+
+/**
+ * Where an enemy's body points (e.face, yaw). Only an aggro'd enemy that is attacking or standing
+ * at the hero looks AT the hero; otherwise it faces where it is actually going (velocity), so a
+ * blob walking home turns around instead of moonwalking. Knocked back / stunned: keep facing the
+ * attacker. Turned smoothly at a capped rate. Uses the previous tick's velocity (what was drawn).
+ */
+function updateFacing(s: GameState, e: Enemy, dt: number, samePlace: boolean, d: number) {
+  if (e.stun > 0 || e.state === "stunned") return;
+  const p = s.player;
+  const speed = len(e.vx, e.vy);
+  let want: number | null = null;
+  if (e.kind === "boss") {
+    if (!s.flags.bossAwake || !samePlace) want = null;
+    else if (e.state === "windup" || e.state === "lunge") want = yawOf(e.wx, e.wy);
+    else want = yawOf(p.x - e.x, p.y - e.y);
+  } else if (e.state === "chase") {
+    // closing in / brawling: eyes on the hero; otherwise along the route (around hedges, to a portal)
+    if (samePlace && (d < 1.6 || speed < 0.3)) want = yawOf(p.x - e.x, p.y - e.y);
+    else if (speed > 0.15) want = yawOf(e.vx, e.vy);
+  } else if (speed > 0.15) want = yawOf(e.vx, e.vy); // return / wander
+  if (want === null) return;
+  let diff = want - e.face;
+  while (diff > Math.PI) diff -= Math.PI * 2;
+  while (diff < -Math.PI) diff += Math.PI * 2;
+  const rate = (e.kind === "boss" ? 9 : e.state === "chase" ? 12 : 7) * dt;
+  e.face += Math.max(-rate, Math.min(rate, diff));
+  if (e.face > Math.PI) e.face -= Math.PI * 2;
+  else if (e.face < -Math.PI) e.face += Math.PI * 2;
 }
 
 function hasLineOfSight(s: GameState, map: MapId, x0: number, y0: number, x1: number, y1: number): boolean {
