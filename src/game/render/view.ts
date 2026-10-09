@@ -107,6 +107,7 @@ export class GameView {
   engine: Engine;
   scene: Scene;
   camera: FreeCamera;
+  private glow: GlowLayer;
   private hemi: HemisphericLight;
   private sun: DirectionalLight;
   private shadows: ShadowGenerator;
@@ -175,13 +176,14 @@ export class GameView {
     this.shadows.normalBias = 0.01;
     this.shadows.darkness = 0.35;
 
-    const glow = new GlowLayer("glow", scene, { blurKernelSize: 32 });
+    const glow = (this.glow = new GlowLayer("glow", scene, { blurKernelSize: 32 }));
     glow.intensity = 0.55;
 
     this.buildBackdrop();
     this.buildGround(OVERWORLD);
     this.buildGround(DUNGEON);
     this.water = this.buildWater();
+    this.glow.addExcludedMesh(this.water);
     this.buildOverworldProps();
     this.buildDungeonProps();
     const tuftPot = this.buildBreakables();
@@ -342,9 +344,9 @@ export class GameView {
     const s = this.scene;
     const w = MeshBuilder.CreateGround("water", { width: 48, height: 24, subdivisions: 1 }, s);
     w.position.set(24, -0.14, -12);
-    const m = material(s, "water-mat", "#3fb8b0", { spec: 0.9, alpha: 0.82 });
-    m.specularPower = 64;
-    m.emissiveColor = hex("#0d3f44");
+    const m = material(s, "water-mat", "#0c3a48", { spec: 0.8, alpha: 0.88 });
+    m.specularPower = 48;
+    m.emissiveColor = hex("#06262c");
     w.material = m;
     w.receiveShadows = true;
     return w;
@@ -829,7 +831,7 @@ export class GameView {
         mesh.material = mat;
         mesh.receiveShadows = true;
         this.shadows.addShadowCaster(mesh);
-        const s = e.kind === "boss" ? 2.25 : 0.95;
+        const s = e.kind === "boss" ? 1.95 : 0.95;
         root.scaling.setAll(s);
         v = { root, mesh, mat, wasAlive: e.alive, spawnT: 1, yaw: 0 };
         this.enemyViews.set(e.id, v);
@@ -946,7 +948,7 @@ export class GameView {
     const sh = this.shake * this.shake;
     const ox = (Math.random() - 0.5) * sh * 1.2, oy = (Math.random() - 0.5) * sh * 1.2;
     // classic Zelda tilt: high and behind, looking down at ~55°
-    this.camera.position.set(this.camTarget.x + ox, 12.5 + oy, this.camTarget.z - 8.6);
+    this.camera.position.set(this.camTarget.x + ox, 11.2 + oy, this.camTarget.z - 7.7);
     this.camera.setTarget(new Vector3(this.camTarget.x + ox, 0, this.camTarget.z + 0.2));
     // sun + shadow frustum follow the action
     const c = new Vector3(this.camTarget.x, 0, this.camTarget.z + 2);

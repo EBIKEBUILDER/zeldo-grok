@@ -28,6 +28,8 @@ export default function Game() {
     const sfx = (sfxRef.current = new Sfx());
     sfx.setMuted(useGameStore.getState().muted);
     const input: InputState = { up: false, down: false, left: false, right: false, attack: false };
+    // Keys tapped between two sim ticks still count for one tick (no lost quick taps on slow frames).
+    const tapped = { up: false, down: false, left: false, right: false };
 
     const startOrRetry = () => {
       sfx.unlock();
@@ -40,6 +42,7 @@ export default function Game() {
       const dir = KEYMAP[e.code];
       if (dir) {
         input[dir] = true;
+        tapped[dir] = true;
         e.preventDefault();
       }
       if (e.code === "Space") {
@@ -84,8 +87,18 @@ export default function Game() {
       const ticks = Math.floor(acc / DT);
       acc -= ticks * DT;
       const store = useGameStore.getState();
-      if (ticks > 0 && store.game.phase === "playing") store.step(input, Math.min(ticks, 8));
-      else input.attack = input.attack && store.game.phase === "playing";
+      if (ticks > 0 && store.game.phase === "playing") {
+        const frameInput: InputState = {
+          up: input.up || tapped.up,
+          down: input.down || tapped.down,
+          left: input.left || tapped.left,
+          right: input.right || tapped.right,
+          attack: input.attack,
+        };
+        store.step(frameInput, Math.min(ticks, 15));
+        input.attack = false;
+        tapped.up = tapped.down = tapped.left = tapped.right = false;
+      } else if (store.game.phase !== "playing") input.attack = false;
       const game = useGameStore.getState().game;
       for (const ev of view.newEvents(game)) {
         sfx.play(ev.type);
