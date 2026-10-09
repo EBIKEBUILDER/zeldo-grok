@@ -1,4 +1,5 @@
 /** Tiny Web Audio synth — every sound is generated, no audio files. */
+import { Music, type TrackId } from "./music";
 import type { EventType } from "./types";
 
 type Wave = OscillatorType;
@@ -8,6 +9,8 @@ export class Sfx {
   private master: GainNode | null = null;
   private noiseBuf: AudioBuffer | null = null;
   private muted = false;
+  private music: Music | null = null;
+  private wantTrack: TrackId | null = null;
 
   /** Must be called from a user gesture (start/click/key) to satisfy autoplay rules. */
   unlock() {
@@ -23,8 +26,32 @@ export class Sfx {
       this.noiseBuf = this.ctx.createBuffer(1, len, this.ctx.sampleRate);
       const d = this.noiseBuf.getChannelData(0);
       for (let i = 0; i < len; i++) d[i] = Math.random() * 2 - 1;
+      this.music = new Music(this.ctx, this.master);
+      this.music.play(this.wantTrack);
     }
     if (this.ctx.state === "suspended") void this.ctx.resume().catch(() => {});
+  }
+
+  /** Choose the background track (null = silence). Safe to call every frame. */
+  setTrack(id: TrackId | null, fade?: number) {
+    this.wantTrack = id;
+    if (this.music && this.music.track !== id) this.music.play(id, fade);
+  }
+
+  /** for debugging/automated checks */
+  get status() {
+    return { ctx: this.ctx?.state ?? "none", track: this.music?.track ?? null, muted: this.muted };
+  }
+
+  stingVictory() {
+    if (!this.muted) this.music?.sting();
+  }
+
+  dispose() {
+    this.music?.dispose();
+    this.music = null;
+    void this.ctx?.close().catch(() => {});
+    this.ctx = null;
   }
 
   setMuted(m: boolean) {

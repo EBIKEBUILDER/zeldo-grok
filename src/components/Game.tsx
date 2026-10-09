@@ -102,8 +102,17 @@ export default function Game() {
       const game = useGameStore.getState().game;
       for (const ev of view.newEvents(game)) {
         sfx.play(ev.type);
+        if (ev.type === "bossDie") sfx.stingVictory();
         view.handleEvent(ev);
       }
+      // background music follows the situation; Sfx crossfades only when the track changes
+      const f = game.flags;
+      let track: "over" | "dungeon" | "boss" | null = null;
+      if (game.phase === "playing" && game.victoryT < 0) {
+        if (game.player.map === "over") track = "over";
+        else track = f.bossAwake && !f.bossDefeated ? "boss" : "dungeon";
+      }
+      sfx.setTrack(track, game.phase === "gameover" ? 0.8 : f.bossAwake && !f.bossDefeated ? 0.6 : 1.6);
       view.sync(game, frameDt);
       view.render();
     });
@@ -112,7 +121,7 @@ export default function Game() {
     window.addEventListener("resize", onResize);
 
     // handy for debugging / automated checks
-    (window as unknown as { __zeldo: unknown }).__zeldo = { store: useGameStore, view };
+    (window as unknown as { __zeldo: unknown }).__zeldo = { store: useGameStore, view, sfx };
 
     return () => {
       window.removeEventListener("keydown", onKeyDown);
@@ -121,6 +130,7 @@ export default function Game() {
       window.removeEventListener("resize", onResize);
       canvas.removeEventListener("pointerdown", onPointerDown);
       unsubMute();
+      sfx.dispose();
       view.dispose();
     };
   }, []);
