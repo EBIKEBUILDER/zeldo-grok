@@ -2,7 +2,7 @@ import { describe, expect, it } from "vitest";
 import { createInitialState, gateClosed, startGame, stepGame } from "@/game/sim";
 import type { GameState, InputState } from "@/game/types";
 import { CHEST, DUNGEON_ENTRY, GATE_ROW, MAPS, OVER_DOOR, PEDESTAL, SPAWN, Tile, isSolidTile, tileAt } from "@/game/world";
-import { PLAYER_R, SAFE_RADIUS } from "@/game/constants";
+import { BLOB_AGGRO, PLAYER_R, SAFE_RADIUS, SPAWN_CLEARANCE } from "@/game/constants";
 
 const idle = (): InputState => ({ up: false, down: false, left: false, right: false, attack: false });
 function run(s: GameState, input: Partial<InputState>, ticks: number) {
@@ -59,6 +59,21 @@ describe("movement", () => {
 });
 
 describe("fairness", () => {
+  it("every enemy starts (and respawns) well clear of spawn — outside aggro range plus a margin", () => {
+    const s = fresh();
+    for (const e of s.enemies.filter((e) => e.map === "over")) {
+      expect(Math.hypot(e.homeX - SPAWN.x, e.homeY - SPAWN.y)).toBeGreaterThanOrEqual(SPAWN_CLEARANCE);
+      expect(SPAWN_CLEARANCE).toBeGreaterThan(BLOB_AGGRO + SAFE_RADIUS + 2);
+    }
+  });
+
+  it("a just-spawned player who idles a few steps outside the bubble isn't swarmed in the first 10 s", () => {
+    const s = fresh();
+    s.player.x = SPAWN.x + SAFE_RADIUS + 1;
+    run(s, {}, 60 * 10);
+    expect(s.player.hp).toBe(s.player.maxHp);
+  });
+
   it("player standing at spawn is never attacked", () => {
     const s = fresh();
     run(s, {}, 60 * 120);

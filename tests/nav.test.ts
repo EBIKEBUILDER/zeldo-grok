@@ -2,7 +2,7 @@ import { afterEach, describe, expect, it } from "vitest";
 import { contactRange, gateClosed, playerField, stepGame } from "@/game/sim";
 import { NAV_MAX_REQUESTS_PER_TICK, NAV_TICK_NODES, fieldAt } from "@/game/path";
 import { navGrid, navStats } from "@/game/nav";
-import { BLOB_GIVEUP, CONTACT_COOLDOWN, SCREEN_H, SCREEN_W } from "@/game/constants";
+import { BLOB_GIVEUP, CONTACT_COOLDOWN, SAFE_RADIUS, SCREEN_H, SCREEN_W } from "@/game/constants";
 import { GATE_ROW, GATE_X, MAPS, OVER_DOOR, PORTALS, SPAWN, isSolidTile, tileAt } from "@/game/world";
 import type { Enemy, GameState } from "@/game/types";
 import { fresh, idle, run } from "./helpers";
@@ -301,22 +301,42 @@ describe("contact damage", () => {
     for (const b of crowd) expect(Math.hypot(b.x - px, b.y - py)).toBeLessThan(contactRange(b));
   });
 
-  it("chasers break off when the hero steps into the sanctuary and never touch them there", () => {
+  it("a chaser hot on the hero's heels turns back cleanly at the spawn bubble (no edge loitering/jitter)", () => {
     const s = fresh();
     const e = blobs(s)[0];
     only(s, [e]);
-    place(e, SPAWN.x + 7.5, SPAWN.y);
-    s.player.x = SPAWN.x + 5.2; s.player.y = SPAWN.y; s.player.invuln = 0;
+    // hero walks west along the east road into the bubble with a blob right behind them
+    place(e, SPAWN.x + 7.2, SPAWN.y);
+    s.player.x = SPAWN.x + 6; s.player.y = SPAWN.y; s.player.invuln = 1e9;
     chase(e);
-    run(s, {}, 10);
-    s.player.x = SPAWN.x + 2; s.player.y = SPAWN.y;
-    const seen = new Set<string>();
-    for (let i = 0; i < 60 * 3; i++) {
-      stepGame(s, idle());
-      seen.add(e.state);
+    run(s, {}, 5);
+    s.player.invuln = 0;
+    let brokeOff = -1, settled = -1, minSpawnD = Infinity, closest = Infinity, rechased = false;
+    const dist: number[] = [];
+    for (let i = 0; i < 60 * 6; i++) {
+      const inside = Math.hypot(s.player.x - SPAWN.x, s.player.y - SPAWN.y) < SAFE_RADIUS - 0.5;
+      stepGame(s, { ...idle(), left: !inside && i % 5 < 2 }); // chase pace, so the blob stays close
+      const d = Math.hypot(e.x - SPAWN.x, e.y - SPAWN.y);
+      minSpawnD = Math.min(minSpawnD, d);
+      dist.push(d);
+      if (brokeOff < 0 && e.state === "return") brokeOff = i;
+      if (brokeOff < 0) closest = Math.min(closest, Math.hypot(e.x - s.player.x, e.y - s.player.y));
+      if (brokeOff >= 0 && settled < 0 && e.state !== "return") settled = i;
+      if (brokeOff >= 0 && e.state === "chase") rechased = true;
     }
-    expect(seen.has("return")).toBe(true);
-    expect(e.state).not.toBe("chase");
-    expect(s.player.hp).toBe(s.player.maxHp);
+    expect(brokeOff).toBeGreaterThanOrEqual(0);
+    // never inside the bubble, and once it broke off it walked away: no edge-hugging back-and-forth
+    expect(minSpawnD).toBeGreaterThan(SAFE_RADIUS + e.r - 0.01);
+    expect(closest).toBeLessThan(1.5); // it really was on the hero's heels
+    expect(rechased).toBe(false);
+    // from the break-off until it is home it only walks away — no edge-hugging back-and-forth
+    expect(settled).toBeGreaterThan(brokeOff);
+    let approaches = 0;
+    for (let i = brokeOff + 20; i < settled - 1; i++) if (dist[i + 1] < dist[i] - 1e-3) approaches++;
+    expect(approaches).toBeLessThan(5);
+    // the hero idling inside the bubble takes no damage after stepping in
+    const hp = s.player.hp;
+    run(s, {}, 60 * 10);
+    expect(s.player.hp).toBe(hp);
   });
 });

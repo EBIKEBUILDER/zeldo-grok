@@ -73,12 +73,14 @@ export const PUDDLE_R = 0.85;
 export const PUDDLE_LIFE = 1.6;
 
 /**
- * Spawn sanctuary (the Hearthollow plaza): enemies never enter it, never aggro on or touch a player
- * inside it, and chasers break off the moment the player steps in. 4.5 keeps it to the plaza so
- * chasers can follow through the hedge gaps into Hearthollow (6.5 reached the screen edges and
- * read as an invisible wall at the boundary).
+ * Spawn bubble (anti-AFK): a small circle around the spawn point. Enemies never enter it, never aggro
+ * on or touch a player inside it, and chasers break off the moment the player steps in. A couple of
+ * steps leave it. Initial enemies all start ≥ SPAWN_CLEARANCE tiles from spawn (tested), so a fresh
+ * spawn is never swarmed.
  */
-export const SAFE_RADIUS = 4.5;
+export const SAFE_RADIUS = 2.5;
+/** Minimum distance from spawn to any enemy's starting/respawn spot. */
+export const SPAWN_CLEARANCE = 11;
 /** No-path fallback: replan at most this often, and only if the target moved ≥ 3 tiles. */
 export const NAV_FALLBACK_REPATH_TICKS = 30;
 

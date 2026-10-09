@@ -38,7 +38,7 @@ The browser check fails on any console error or warning, including React dev-onl
 | Perf overlay | F3 / ` / pause menu | pause menu |
 
 ## The quest
-You start in **Hearthollow**, a safe village with a cottage and a well. Enemies can't enter the village plaza around spawn and give up the chase when you reach it. Head north through **Cinderstone Crags** to the arched doorway of the **Mossgrave Vault**. Grab the key from the pedestal in the Antechamber and unlock the gate. The gate slams shut behind you, and you fight **Gloomgulp, the Vault Warden**. Beat it and a chest rises with the Sunstone inside.
+You start in **Hearthollow**, a safe village with a cottage and a well. A small safe bubble around the spawn point keeps an idle player safe: enemies can't enter it and give up the chase when you step in. Head north through **Cinderstone Crags** to the arched doorway of the **Mossgrave Vault**. Grab the key from the pedestal in the Antechamber and unlock the gate. The gate slams shut behind you, and you fight **Gloomgulp, the Vault Warden**. Beat it and a chest rises with the Sunstone inside.
 
 ## Enemy AI (`src/game/path.ts`, `nav.ts`, `sim.ts`)
 - **One stitched nav grid:** the 3×2 overworld screens are a single 48×24 grid, so screen edges are ordinary tile neighbours. A* and the flow field never see chunks, and chasers follow you through the hedge gaps into the next screen. Enemies simulate everywhere (nothing is frozen or culled off-screen) and render wherever the camera sees them.
@@ -63,7 +63,7 @@ You start in **Hearthollow**, a safe village with a cottage and a well. Enemies 
 - **Contact damage:**
   - Bodies separate at hero radius + enemy radius (0.72 for blobs). Blobs hit out to 0.90, so a visibly touching blob always connects. The Warden keeps his 0.08 margin.
   - When several enemies are touching you and off cooldown, the one that has waited longest lands the hit, so every adjacent blob gets a turn.
-- **Spawn sanctuary:** the Hearthollow plaza, radius 4.5. Enemies never enter it, never aggro on or touch you inside it, and chasers break off the moment you step in.
+- **Spawn bubble (anti-AFK):** radius 2.5 around the spawn point. Enemies never enter it, never aggro on or touch you inside it, and chasers break off the moment you step in. A couple of steps leave it. Every enemy starts at least 11 tiles from spawn (aggro range 5.5 + bubble 2.5 + margin), so a fresh spawn is never swarmed.
 - **The Warden** (1.6 tiles wide) pushes field waypoints away from walls so it uses 2-tile corridors instead of grinding into pillars.
 
 ## Boss telegraphs
