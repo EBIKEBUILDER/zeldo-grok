@@ -50,6 +50,7 @@ export function createInitialState(seed = 12345): GameState {
       alive: true,
       state: "idle",
       stateT: 0.5 + (id % 5) * 0.3,
+      stateDur: 0,
       wx: 0,
       wy: 0,
       hitFlash: 0,
@@ -446,6 +447,7 @@ function hitBoss(s: GameState, e: Enemy, dx: number, dy: number) {
   e.guardCd = C.BOSS_GUARD;
   e.state = "windup";
   e.stateT = C.BOSS_COUNTER_WINDUP;
+  e.stateDur = e.stateT;
   const px = s.player.x - e.x, py = s.player.y - e.y;
   const pl = len(px, py) || 1;
   e.wx = px / pl;
@@ -869,7 +871,8 @@ function updateBoss(s: GameState, e: Enemy, dt: number, dx: number, dy: number, 
       }
       if (e.lungeCd <= 0 && canLunge && d > 1.6) {
         e.state = "windup";
-        e.stateT = enraged ? 0.65 : C.BOSS_WINDUP;
+        e.stateT = enraged ? C.BOSS_WINDUP_ENRAGED : C.BOSS_WINDUP;
+        e.stateDur = e.stateT;
         e.wx = nx;
         e.wy = ny;
         emit(s, "bossCharge", e.map, e.x, e.y, nx, ny);

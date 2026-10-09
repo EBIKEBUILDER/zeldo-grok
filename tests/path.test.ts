@@ -1,3 +1,4 @@
+import { BOSS_LUNGE_DIST, BOSS_LUNGE_DMG, BOSS_WINDUP } from "@/game/constants";
 import { describe, expect, it } from "vitest";
 import { boxHitsSolid, globHits, playerField, stepGame } from "@/game/sim";
 import { fieldAt } from "@/game/path";
@@ -158,6 +159,46 @@ describe("glob fuse", () => {
   it("radius numbers: escape distance and timing are as documented", () => {
     expect(GLOB_SPLASH_R).toBeCloseTo(1.15);
     expect(GLOB_FUSE).toBeCloseTo(0.8);
+  });
+});
+
+describe("lunge telegraph", () => {
+  /** Boss at (5,5.5) facing a player 4 tiles east; returns state at the moment the windup starts. */
+  function chargeStart() {
+    const s = bossFight();
+    const b = boss(s);
+    b.x = 5; b.y = 5.5; b.vx = b.vy = 0; b.state = "chase"; b.lungeCd = 0; b.spitCd = 99; b.guardCd = 0;
+    s.player.x = 9; s.player.y = 5.5; s.player.vx = s.player.vy = 0; s.player.invuln = 0;
+    for (let i = 0; i < 60 && (b.state as string) !== "windup"; i++) {
+      s.player.x = 9; s.player.y = 5.5;
+      stepGame(s, idle());
+    }
+    expect(b.state).toBe("windup");
+    expect(s.events.some((e) => e.type === "bossCharge")).toBe(true);
+    expect(b.stateDur).toBeCloseTo(BOSS_WINDUP);
+    return { s, b };
+  }
+  function lungeDamage(s: ReturnType<typeof bossFight>, react: number, dir: Partial<ReturnType<typeof idle>>) {
+    const b = boss(s);
+    let dmg = 0;
+    for (let i = 0; i < 120; i++) {
+      const hp = s.player.hp;
+      stepGame(s, i / 60 >= react ? { ...idle(), ...dir } : idle());
+      if (b.state === "lunge" || b.state === "windup") dmg += hp - s.player.hp;
+      if (b.state === "stunned") break;
+    }
+    return dmg;
+  }
+  it.each([0.25, 0.3])("a sidestep %ss after the charge cue clears the lane", (react) => {
+    const { s } = chargeStart();
+    expect(lungeDamage(s, react, { down: true })).toBe(0);
+  });
+  it("standing still in the lane eats the lunge (a full heart)", () => {
+    const { s } = chargeStart();
+    expect(lungeDamage(s, 99, {})).toBe(BOSS_LUNGE_DMG);
+  });
+  it("the lane length is the true lunge reach", () => {
+    expect(BOSS_LUNGE_DIST).toBeCloseTo(5.5);
   });
 });
 

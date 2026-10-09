@@ -56,6 +56,8 @@ export interface Enemy {
   alive: boolean;
   state: EnemyState;
   stateT: number;
+  /** full length of the current timed state (windups) — lets the view show fill progress */
+  stateDur: number;
   wx: number;
   wy: number;
   hitFlash: number;

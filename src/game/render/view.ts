@@ -25,7 +25,7 @@ import {
   VertexData,
   type AbstractMesh,
 } from "@babylonjs/core";
-import { GLOB_SPLASH_R, SWING_HALF_ARC, SWING_TIME } from "../constants";
+import { BOSS_AIM_LOCK, BOSS_LUNGE_DIST, BOSS_R, GLOB_FUSE, GLOB_SPLASH_R, PLAYER_R, SWING_HALF_ARC, SWING_TIME } from "../constants";
 import { hash2, makeRng } from "../rng";
 import { chestVisible, gateClosed } from "../sim";
 import type { GameEvent, GameState } from "../types";
@@ -52,9 +52,14 @@ import {
 const MAP_OFFSET: Record<MapId, number> = { over: 0, dungeon: 120 };
 
 /** Map space (x east, y south) → Babylon world (x right, y up, z north/away from camera). */
-export function toWorld(map: MapId, x: number, y: number, h = 0): Vector3 {
-  return new Vector3(x + MAP_OFFSET[map], h, -y);
+export function toWorld(map: MapId, x: number, y: number, h = 0, out?: Vector3): Vector3 {
+  return out ? out.set(x + MAP_OFFSET[map], h, -y) : new Vector3(x + MAP_OFFSET[map], h, -y);
 }
+
+/** Glob hit radius for the hero's centre — the fuse ring is drawn exactly here. */
+const GLOB_HIT_R = GLOB_SPLASH_R + PLAYER_R / 2;
+const LANE_W = BOSS_R * 0.85 * 2; // the Warden's collision width
+const LANE_LEN = BOSS_LUNGE_DIST + BOSS_R * 0.85; // centre travel + front of the body
 
 const tmpQ = new Quaternion();
 const tmpS = new Vector3();
@@ -143,7 +148,16 @@ export class GameView {
   private ringBase: Mesh;
   private discBase: Mesh;
   private puddleBase: Mesh;
-  private globMeshes = new Map<number, { ball: AbstractMesh; ring: AbstractMesh; disc: AbstractMesh }>();
+  private globMeshes = new Map<number, { ball: Mesh | AbstractMesh; ring: AbstractMesh; disc: AbstractMesh; landed: boolean }>();
+  private laneRoot: TransformNode;
+  private laneBg: Mesh;
+  private laneFill: Mesh;
+  private laneHead: Mesh;
+  private laneBgMat: StandardMaterial;
+  private laneFillMat: StandardMaterial;
+  private laneYaw = 0;
+  private laneAlpha = 0;
+  private tmpV = new Vector3();
   private puddleMeshes = new Map<number, AbstractMesh>();
   private particles: Particle[] = [];
   private particleMesh: Mesh;
@@ -250,18 +264,51 @@ export class GameView {
     const gm = material(scene, "glob-mat", "#ffffff", { spec: 0.6 });
     gm.emissiveColor = hex("#3a7a1a");
     this.globBase.material = gm;
+    this.globBase.registerInstancedBuffer("color", 4);
+    this.globBase.instancedBuffers.color = new Color4(1, 1, 1, 1);
     this.globBase.setEnabled(false);
     this.ringBase = MeshBuilder.CreateTorus("globRing", { diameter: 2, thickness: 0.07, tessellation: 28 }, scene);
     const rm = material(scene, "ring-mat", "#ff5a7a", { emissive: "#ff2a5a" });
     rm.disableLighting = true;
     this.ringBase.material = rm;
+    this.ringBase.registerInstancedBuffer("color", 4);
+    this.ringBase.instancedBuffers.color = new Color4(1, 1, 1, 1);
     this.ringBase.setEnabled(false);
+    // lunge lane: a ground decal from the Warden to his max reach (local +z = forward, length 1)
+    this.laneRoot = new TransformNode("laneRoot", scene);
+    const lanePlane = (name: string, mat: StandardMaterial, y: number) => {
+      const m = MeshBuilder.CreateGround(name, { width: 1, height: 1 }, scene);
+      m.position.z = 0.5;
+      m.bakeCurrentTransformIntoVertices();
+      m.position.y = y;
+      m.material = mat;
+      m.parent = this.laneRoot;
+      m.isPickable = false;
+      return m;
+    };
+    this.laneBgMat = material(scene, "lane-bg", "#ff7a3a", { emissive: "#ff5a1a", alpha: 0.18 });
+    this.laneBgMat.disableLighting = true;
+    this.laneFillMat = material(scene, "lane-fill", "#ffb03a", { emissive: "#ff8a1a", alpha: 0.4 });
+    this.laneFillMat.disableLighting = true;
+    this.laneBg = lanePlane("laneBg", this.laneBgMat, 0.035);
+    this.laneFill = lanePlane("laneFill", this.laneFillMat, 0.045);
+    const head = MeshBuilder.CreateDisc("laneHead", { radius: 0.5, tessellation: 3 }, scene);
+    head.rotation.x = Math.PI / 2;
+    head.rotation.y = -Math.PI / 2; // a vertex points along +z
+    head.bakeCurrentTransformIntoVertices();
+    head.material = this.laneFillMat;
+    head.parent = this.laneRoot;
+    head.position.y = 0.05;
+    this.laneHead = head;
+    this.laneRoot.setEnabled(false);
     this.discBase = MeshBuilder.CreateDisc("globDisc", { radius: 1, tessellation: 28 }, scene);
     this.discBase.rotation.x = Math.PI / 2;
     this.discBase.bakeCurrentTransformIntoVertices();
     const dm = material(scene, "disc-mat", "#ff3a6a", { emissive: "#a0103a", alpha: 0.28 });
     dm.disableLighting = true;
     this.discBase.material = dm;
+    this.discBase.registerInstancedBuffer("color", 4);
+    this.discBase.instancedBuffers.color = new Color4(1, 1, 1, 1);
     this.discBase.setEnabled(false);
     this.puddleBase = MeshBuilder.CreateDisc("puddle", { radius: 1, tessellation: 12 }, scene);
     this.puddleBase.rotation.x = Math.PI / 2;
@@ -898,27 +945,35 @@ export class GameView {
       // squash & stretch
       const rate = e.state === "chase" || e.state === "lunge" ? 11 : 5;
       let sq = Math.sin(this.time * rate + e.id) * (e.state === "chase" ? 0.12 : 0.07);
-      if (e.state === "windup") sq = -0.25 + Math.sin(this.time * 40) * 0.04;
+      const wind = e.state === "windup" ? Math.min(1, Math.max(0, 1 - e.stateT / (e.stateDur || 0.8))) : 0;
+      if (e.state === "windup") sq = -0.08 - 0.27 * wind * (2 - wind) + Math.sin(this.time * (24 + 36 * wind)) * 0.035 * wind;
       if (e.stun > 0) sq = 0.18;
       const sp = v.spawnT * (2 - v.spawnT);
       v.mesh.scaling.set((1 - sq * 0.6) * sp, (1 + sq) * sp, (1 - sq * 0.6) * sp);
       // hit flash (white) / windup glow (amber)
       const pulse = 0.5 + 0.5 * Math.sin(this.time * 14);
       if (e.hitFlash > 0) v.mat.emissiveColor.set(1, 1, 1);
-      else if (e.state === "windup") v.mat.emissiveColor.set(0.55 + pulse * 0.35, 0.28 + pulse * 0.15, 0.03);
+      else if (e.state === "windup") {
+        // glow ramps with the charge and pulses faster; a hot flash once the aim locks
+        const fast = 0.5 + 0.5 * Math.sin(this.time * (10 + 40 * wind));
+        const locked = e.stateT <= BOSS_AIM_LOCK;
+        const k = 0.25 + 0.75 * wind;
+        v.mat.emissiveColor.set((0.6 + fast * 0.4) * k, (0.25 + fast * 0.2 + (locked ? 0.25 : 0)) * k, locked ? 0.12 * k : 0.02);
+      }
       else if (e.state === "lunge") v.mat.emissiveColor.set(0.7, 0.35, 0.05);
       else if (e.state === "spitWindup") v.mat.emissiveColor.set(0.15, 0.35 + pulse * 0.3, 0.05);
       else if (e.state === "stunned") v.mat.emissiveColor.set(0.12, 0.2, 0.45 + pulse * 0.15);
       else if (e.kind === "boss" && e.guardCd > 0) v.mat.emissiveColor.set(0.22, 0.22, 0.28);
       else if (e.kind === "boss" && !state.flags.bossAwake) v.mat.emissiveColor.set(0, 0, 0.02);
       else v.mat.emissiveColor.set(0, 0, 0);
-      v.mesh.position.x = e.state === "windup" ? Math.sin(this.time * 60) * 0.03 : 0;
+      v.mesh.position.x = e.state === "windup" ? Math.sin(this.time * 60) * 0.035 * (0.3 + wind) : 0;
       v.mesh.rotation.z = e.state === "stunned" ? Math.sin(this.time * 7) * 0.2 : 0;
       v.mesh.rotation.x = e.state === "stunned" ? Math.cos(this.time * 7) * 0.12 : e.state === "lunge" ? 0.25 : 0;
       if (e.state === "stunned") v.mesh.rotation.y = v.yaw + Math.sin(this.time * 3.5) * 0.6;
       if (e.state === "spitWindup") v.mesh.scaling.set(1.15 + pulse * 0.08, 0.9, 1.15 + pulse * 0.08);
       if (e.kind === "boss" && !state.flags.bossAwake) v.mesh.scaling.y *= 0.92;
       if (e.kind === "boss") {
+        this.syncLane(e, dt);
         const dizzy = e.state === "stunned";
         this.stars.forEach((st, i) => {
           st.setEnabled(dizzy);
@@ -929,6 +984,35 @@ export class GameView {
         });
       }
     }
+  }
+
+  /** Lunge lane decal: fills during the windup, turns red and locks once the aim is locked. */
+  private syncLane(e: GameState["enemies"][number], dt: number) {
+    const active = e.alive && (e.state === "windup" || e.state === "lunge");
+    this.laneAlpha = active ? 1 : Math.max(0, this.laneAlpha - dt * 5);
+    this.laneRoot.setEnabled(this.laneAlpha > 0.01);
+    if (this.laneAlpha <= 0.01) return;
+    if (active) {
+      this.laneYaw = Math.atan2(e.wx, -e.wy);
+      if (e.state === "windup") toWorld(e.map, e.x, e.y, 0, this.laneRoot.position);
+    }
+    this.laneRoot.rotation.y = this.laneYaw;
+    const wind = e.state === "windup" ? Math.min(1, Math.max(0, 1 - e.stateT / (e.stateDur || 0.8))) : 1;
+    const locked = e.state !== "windup" || e.stateT <= BOSS_AIM_LOCK;
+    this.laneBg.scaling.set(LANE_W, 1, LANE_LEN);
+    this.laneFill.scaling.set(LANE_W * (locked ? 1 : 0.8), 1, Math.max(0.01, LANE_LEN * wind));
+    this.laneHead.position.z = LANE_LEN + 0.02;
+    this.laneHead.scaling.setAll(LANE_W * 1.2);
+    const fl = locked ? 0.75 + 0.25 * Math.sin(this.time * 40) : 1;
+    if (locked) {
+      this.laneFillMat.emissiveColor.set(1 * fl, 0.12, 0.08);
+      this.laneFillMat.diffuseColor.set(1, 0.2, 0.15);
+    } else {
+      this.laneFillMat.emissiveColor.set(1, 0.55, 0.1);
+      this.laneFillMat.diffuseColor.set(1, 0.69, 0.23);
+    }
+    this.laneFillMat.alpha = (locked ? 0.55 : 0.38) * this.laneAlpha;
+    this.laneBgMat.alpha = 0.2 * this.laneAlpha;
   }
 
   private syncPickups(state: GameState) {
@@ -998,21 +1082,56 @@ export class GameView {
       seen.add(g.id);
       let m = this.globMeshes.get(g.id);
       if (!m) {
-        m = { ball: this.globBase.createInstance("gb" + g.id), ring: this.ringBase.createInstance("gr" + g.id), disc: this.discBase.createInstance("gd" + g.id) };
+        m = { ball: this.globBase.createInstance("gb" + g.id), ring: this.ringBase.createInstance("gr" + g.id), disc: this.discBase.createInstance("gd" + g.id), landed: false };
+        m.ball.instancedBuffers.color = new Color4(1, 1, 1, 1);
+        m.ring.instancedBuffers.color = new Color4(1, 1, 1, 1);
+        m.disc.instancedBuffers.color = new Color4(1, 1, 1, 1);
         this.shadows.addShadowCaster(m.ball);
         this.globMeshes.set(g.id, m);
       }
       const t = Math.min(1, g.t / g.dur);
+      const fuse = g.t > g.dur ? Math.min(1, (g.t - g.dur) / GLOB_FUSE) : -1;
       const x = g.x0 + (g.tx - g.x0) * t, y = g.y0 + (g.ty - g.y0) * t;
-      m.ball.position.copyFrom(toWorld("dungeon", x, y, 1.0 + 4 * 3.2 * t * (1 - t)));
-      m.ball.rotation.set(this.time * 5, this.time * 3, 0);
-      const target = toWorld("dungeon", g.tx, g.ty, 0.04);
-      m.ring.position.copyFrom(target);
-      const rs = GLOB_SPLASH_R * (0.55 + 0.45 * t) * (1 + Math.sin(this.time * 18) * 0.03);
-      m.ring.scaling.set(rs / 1, 1, rs / 1);
-      m.disc.position.copyFrom(target.add(new Vector3(0, -0.01, 0)));
-      const ds = GLOB_SPLASH_R * t;
-      m.disc.scaling.set(ds, 1, ds);
+      const ballC = (m.ball as Mesh).instancedBuffers.color as Color4;
+      const ringC = m.ring.instancedBuffers.color as Color4;
+      const discC = m.disc.instancedBuffers.color as Color4;
+      if (fuse < 0) {
+        // in flight: arc + the exact landing zone fading in
+        toWorld("dungeon", x, y, 1.0 + 4 * 3.2 * t * (1 - t), m.ball.position);
+        m.ball.rotation.set(this.time * 5, this.time * 3, 0);
+        m.ball.scaling.setAll(1);
+        ballC.set(1, 1, 1, 1);
+        const rs = GLOB_HIT_R * (1 + Math.sin(this.time * 12) * 0.015);
+        m.ring.scaling.set(rs, 1, rs);
+        ringC.set(0.55 + 0.45 * t, 0.55 + 0.45 * t, 0.55 + 0.45 * t, 1);
+        const ds = GLOB_HIT_R * 0.25 * t;
+        m.disc.scaling.set(ds, 1, ds);
+        discC.set(0.6, 0.6, 0.6, 1);
+      } else {
+        // landed: the fuse. Swells, pulses faster and faster, shifts green → white-hot magenta;
+        // the disc fills out to the ring (exact blast radius) as the timer runs down.
+        const freq = 8 + 34 * fuse;
+        const beat = 0.5 + 0.5 * Math.sin(this.time * freq);
+        const swell = 1 + 0.75 * fuse + beat * (0.08 + 0.18 * fuse);
+        toWorld("dungeon", g.tx, g.ty, 0.2 + 0.12 * swell, m.ball.position);
+        m.ball.rotation.set(0, this.time * (2 + 6 * fuse), 0);
+        m.ball.scaling.set(swell * 1.1, swell * (0.85 + 0.1 * beat), swell * 1.1);
+        ballC.set(1 + 1.6 * fuse + beat * fuse, 1 - 0.35 * fuse + 0.8 * fuse * beat, 1 + 1.2 * fuse, 1);
+        if (!m.landed) {
+          m.landed = true;
+          this.emit(g.tx, g.ty, "dungeon", 8, { c: [hex("#7ad04a"), hex("#5b2a7a")], speed: 1.6, up: 2, g: 10, life: 0.35, size: 0.07, h: 0.15 });
+        }
+        const rs = GLOB_HIT_R * (1 + beat * 0.03 * (1 + fuse));
+        m.ring.scaling.set(rs, 1, rs);
+        const rb = 1.1 + 0.9 * beat * (0.4 + fuse);
+        ringC.set(rb, rb, rb, 1);
+        const ds = Math.max(0.01, GLOB_HIT_R * fuse);
+        m.disc.scaling.set(ds, 1, ds);
+        const db = 1 + fuse * 1.2 + beat * 0.3;
+        discC.set(db, db, db, 1);
+      }
+      toWorld("dungeon", g.tx, g.ty, 0.045, m.ring.position);
+      toWorld("dungeon", g.tx, g.ty, 0.03, m.disc.position);
     }
     for (const [id, m] of this.globMeshes)
       if (!seen.has(id)) {
@@ -1204,6 +1323,10 @@ export class GameView {
       case "splash":
         this.emit(e.x, e.y, e.map, 22, { c: [hex("#7ad04a"), hex("#5b2a7a"), hex("#b06ad0")], speed: 3.5, up: 4, g: 12, life: 0.6, size: 0.1, h: 0.2 });
         this.shake = Math.max(this.shake, 0.22);
+        break;
+      case "bossCharge":
+        // feet dig in: a ring of dust kicked back from the lunge heading
+        this.emit(e.x, e.y, e.map, 14, { c: [hex("#b9b2c6"), hex("#8a8496")], speed: 1.4, up: 0.8, g: 1, life: 0.6, size: 0.16, grow: 1.2, h: 0.1, dx: e.dx === undefined ? undefined : -e.dx, dy: e.dy === undefined ? undefined : -e.dy });
         break;
       case "bossRoar":
         this.shake = Math.max(this.shake, 0.5);

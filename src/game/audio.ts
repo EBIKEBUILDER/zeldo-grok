@@ -9,6 +9,7 @@ export class Sfx {
   private master: GainNode | null = null;
   private noiseBuf: AudioBuffer | null = null;
   private muted = false;
+  private paused = false;
   private music: Music | null = null;
   private wantTrack: TrackId | null = null;
 
@@ -20,7 +21,7 @@ export class Sfx {
       if (!AC) return;
       this.ctx = new AC();
       this.master = this.ctx.createGain();
-      this.master.gain.value = this.muted ? 0 : 0.5;
+      this.master.gain.value = this.level;
       this.master.connect(this.ctx.destination);
       const len = this.ctx.sampleRate * 1;
       this.noiseBuf = this.ctx.createBuffer(1, len, this.ctx.sampleRate);
@@ -54,9 +55,19 @@ export class Sfx {
     this.ctx = null;
   }
 
+  private get level() {
+    return this.muted ? 0 : this.paused ? 0.12 : 0.5;
+  }
+
   setMuted(m: boolean) {
     this.muted = m;
-    if (this.master && this.ctx) this.master.gain.setTargetAtTime(m ? 0 : 0.5, this.ctx.currentTime, 0.02);
+    if (this.master && this.ctx) this.master.gain.setTargetAtTime(this.level, this.ctx.currentTime, 0.02);
+  }
+
+  /** Pause menu: duck everything (music keeps its place instead of restarting). */
+  setPaused(p: boolean) {
+    this.paused = p;
+    if (this.master && this.ctx) this.master.gain.setTargetAtTime(this.level, this.ctx.currentTime, 0.05);
   }
 
   private tone(freq: number, dur: number, opts: { type?: Wave; vol?: number; slide?: number; delay?: number; attack?: number } = {}) {
@@ -145,6 +156,17 @@ export class Sfx {
       case "bossRoar":
         this.tone(110, 0.9, { type: "sawtooth", vol: 0.16, slide: 55, attack: 0.1 });
         this.tone(116, 0.9, { type: "sawtooth", vol: 0.12, slide: 58, attack: 0.1 });
+        break;
+      case "bossCharge":
+        // rising growl over the windup — the cue to get out of the lane
+        this.tone(70, 0.75, { type: "sawtooth", vol: 0.14, slide: 330, attack: 0.25 });
+        this.tone(105, 0.75, { type: "square", vol: 0.05, slide: 495, attack: 0.3 });
+        this.noise(0.75, { freq: 300, slide: 2400, q: 3, vol: 0.12 });
+        break;
+      case "globLand":
+        // wet plop, then an accelerating fuse tick
+        this.tone(260, 0.12, { type: "sine", vol: 0.16, slide: 90 });
+        [0.18, 0.4, 0.56, 0.67, 0.74].forEach((d, i) => this.tone(1200 + i * 220, 0.04, { type: "square", vol: 0.045, delay: d }));
         break;
       case "lunge":
         this.noise(0.25, { freq: 400, slide: 1600, vol: 0.25 });
