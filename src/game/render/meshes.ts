@@ -286,21 +286,45 @@ export function makeHeroParts(scene: Scene) {
 }
 
 // ───────────── blob enemy ─────────────
+/** Per-vertex colours on a SMOOTH mesh (keeps shared vertices + smooth normals, no jitter). */
+export function paintSmooth(mesh: Mesh, base: Color3 | ((y: number) => Color3)) {
+  const pos = mesh.getVerticesData(VertexBuffer.PositionKind)!;
+  const n = pos.length / 3;
+  const colors = new Float32Array(n * 4);
+  for (let v = 0; v < n; v++) {
+    const c = typeof base === "function" ? base(pos[v * 3 + 1]) : base;
+    colors.set([c.r, c.g, c.b, 1], v * 4);
+  }
+  mesh.setVerticesData(VertexBuffer.ColorKind, colors);
+  return mesh;
+}
+
+/**
+ * Blob / Warden body. Smooth-shaded UV sphere (14 segments) with a soft belly gradient — the old
+ * flat-shaded subdiv-2 icosphere with ±10% per-triangle colour jitter read as a dimpled golf ball.
+ * Eyes and the crown band are smooth too; the crown spikes and the sprout stay crisp (they're
+ * meant to be pointy). One merged mesh per kind, cloned per enemy (shared geometry).
+ */
 export function makeBlob(scene: Scene, name: string, body: string, belly: string, eye: string, boss: boolean): Mesh {
-  const b = MeshBuilder.CreateIcoSphere("blob", { radius: 0.5, subdivisions: 2 }, scene);
+  const b = MeshBuilder.CreateSphere("blob", { diameter: 1, segments: 14 }, scene);
   b.scaling.set(1, 0.78, 1);
   b.bakeCurrentTransformIntoVertices();
   b.position.y = 0.38;
-  paintFacets(b, (y) => (y < -0.15 ? hex(belly) : hex(body)), 0.1, boss ? 51 : 52);
+  const cBody = hex(body), cBelly = hex(belly);
+  paintSmooth(b, (y) => {
+    // y in [-0.39, 0.39]: belly colour low, blending smoothly into the body colour
+    const t = Math.min(1, Math.max(0, (y + 0.3) / 0.22));
+    return Color3.Lerp(cBelly, cBody, t * t * (3 - 2 * t));
+  });
   const parts: Mesh[] = [b];
   for (const sx of [-1, 1]) {
-    const white = MeshBuilder.CreateSphere("eyeW", { diameter: 0.2, segments: 5 }, scene);
+    const white = MeshBuilder.CreateSphere("eyeW", { diameter: 0.2, segments: 8 }, scene);
     white.position.set(sx * 0.15, 0.52, 0.36);
     white.scaling.z = 0.6;
-    paintFacets(white, hex(eye), 0.02, 53);
-    const pupil = MeshBuilder.CreateSphere("eyeP", { diameter: 0.09, segments: 4 }, scene);
+    paintSmooth(white, hex(eye));
+    const pupil = MeshBuilder.CreateSphere("eyeP", { diameter: 0.09, segments: 6 }, scene);
     pupil.position.set(sx * 0.15, 0.51, 0.43);
-    paintFacets(pupil, hex("#1b1424"), 0, 54);
+    paintSmooth(pupil, hex("#1b1424"));
     parts.push(white, pupil);
     if (boss) {
       const brow = MeshBuilder.CreateBox("brow", { width: 0.2, height: 0.05, depth: 0.05 }, scene);
@@ -313,20 +337,20 @@ export function makeBlob(scene: Scene, name: string, body: string, belly: string
   if (boss) {
     for (let i = 0; i < 5; i++) {
       const a = (i / 5) * Math.PI * 2;
-      const spike = MeshBuilder.CreateCylinder("crown", { height: 0.22, diameterTop: 0, diameterBottom: 0.12, tessellation: 4 }, scene);
+      const spike = MeshBuilder.CreateCylinder("crown", { height: 0.22, diameterTop: 0, diameterBottom: 0.12, tessellation: 6 }, scene);
       spike.position.set(Math.cos(a) * 0.16, 0.8, Math.sin(a) * 0.16);
-      paintFacets(spike, hex("#f2c14b"), 0.08, 60 + i);
+      paintFacets(spike, hex("#f2c14b"), 0, 60 + i);
       parts.push(spike);
     }
-    const band = MeshBuilder.CreateTorus("cband", { diameter: 0.36, thickness: 0.06, tessellation: 10 }, scene);
+    const band = MeshBuilder.CreateTorus("cband", { diameter: 0.36, thickness: 0.06, tessellation: 20 }, scene);
     band.position.y = 0.72;
-    paintFacets(band, hex("#e3a92f"), 0.06, 66);
+    paintSmooth(band, hex("#e3a92f"));
     parts.push(band);
   } else {
-    const sprout = MeshBuilder.CreateCylinder("sprout", { height: 0.18, diameterTop: 0, diameterBottom: 0.08, tessellation: 4 }, scene);
+    const sprout = MeshBuilder.CreateCylinder("sprout", { height: 0.18, diameterTop: 0, diameterBottom: 0.08, tessellation: 6 }, scene);
     sprout.position.set(0.05, 0.8, 0);
     sprout.rotation.z = -0.4;
-    paintFacets(sprout, hex(body), 0.1, 67);
+    paintSmooth(sprout, hex(body).scale(0.9));
     parts.push(sprout);
   }
   const m = merge(parts, name);
