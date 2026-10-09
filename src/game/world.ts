@@ -74,6 +74,31 @@ export const GATE_X = [7, 8];
 export const PEDESTAL = { x: 8, y: 15.6 };
 export const CHEST = { x: 8, y: 2.6 };
 export const BOSS_HOME = { x: 8, y: 5.6 };
+/**
+ * Nav portals: links between tiles that are NOT grid neighbours (the vault doorways). The overworld
+ * itself is one stitched 48×24 grid, so screens need no portals. Pathfinding treats a portal as an
+ * edge of `cost`; enemies only use it when `traversableByAI` (default false for dungeon mouths:
+ * chasers give up at the entrance, classic Zelda leash). Chunk ids match `state.explored`
+ * (overworld screens 0-5 = sy*3+sx, vault antechamber 6, Warden's hall 7).
+ */
+export interface Portal {
+  id: number;
+  fromMap: MapId;
+  fromChunk: number;
+  fromTile: { x: number; y: number };
+  toMap: MapId;
+  toChunk: number;
+  toTile: { x: number; y: number };
+  cost: number;
+  traversableByAI: boolean;
+}
+export const PORTALS: Portal[] = [
+  { id: 1, fromMap: "over", fromChunk: 1, fromTile: { x: 23, y: 2 }, toMap: "dungeon", toChunk: 6, toTile: { x: 7, y: 20 }, cost: 2, traversableByAI: false },
+  { id: 2, fromMap: "over", fromChunk: 1, fromTile: { x: 24, y: 2 }, toMap: "dungeon", toChunk: 6, toTile: { x: 8, y: 20 }, cost: 2, traversableByAI: false },
+  { id: 3, fromMap: "dungeon", fromChunk: 6, fromTile: { x: 7, y: 22 }, toMap: "over", toChunk: 1, toTile: { x: 23, y: 4 }, cost: 2, traversableByAI: false },
+  { id: 4, fromMap: "dungeon", fromChunk: 6, fromTile: { x: 8, y: 22 }, toMap: "over", toChunk: 1, toTile: { x: 24, y: 4 }, cost: 2, traversableByAI: false },
+];
+
 /** Player crossing north of this line (inside the vault) wakes the boss. */
 export const BOSS_TRIGGER_Y = 9.6;
 
