@@ -7,7 +7,12 @@ npm install
 npm run dev      # http://localhost:3000
 npm run build    # production build
 npm test         # sim/quest unit tests (vitest)
+
+# headless console audit against the dev server (needs `npx playwright install chromium` once)
+npm run dev &    # in another terminal: http://localhost:3000
+URL=http://localhost:3000/ npm run check:browser
 ```
+The browser check plays through title → hits taken while messages show → vault → key/gate/boss messages → victory → retry → game over → retry. It fails on any console error or warning, including React dev-only key warnings.
 
 **Controls:** WASD / Arrow keys to move · Space or Click to swing · M to mute · Enter or Click to start/retry
 
