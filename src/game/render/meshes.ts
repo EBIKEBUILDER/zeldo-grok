@@ -181,14 +181,38 @@ export function makeTuft(scene: Scene, name: string, base: string, tip: string, 
 }
 
 // ───────────── pot ─────────────
+/**
+ * Clay pot: ONE closed, single-sided, smooth-shaded lathe. The profile runs up the outside, over a
+ * rolled lip, down the inner wall and across a recessed floor, so the mouth shows a dark interior
+ * instead of a hole. (The old open-topped DOUBLESIDE shell was flat-shaded with per-triangle colour
+ * jitter plus a light band whose edge zig-zagged across triangles — that was the "staggered" look —
+ * and its inside showed the ground through the mouth.)
+ */
 export function makePot(scene: Scene): Mesh {
   const profile = [
-    new Vector3(0, 0, 0), new Vector3(0.2, 0, 0), new Vector3(0.29, 0.14, 0), new Vector3(0.3, 0.26, 0),
-    new Vector3(0.22, 0.42, 0), new Vector3(0.14, 0.5, 0), new Vector3(0.19, 0.56, 0), new Vector3(0.13, 0.56, 0), new Vector3(0.1, 0.5, 0),
-  ];
-  const pot = MeshBuilder.CreateLathe("pot", { shape: profile, tessellation: 8, sideOrientation: Mesh.DOUBLESIDE }, scene);
-  paintFacets(pot, (y) => (y > 0.48 ? hex("#8f4a2a") : y > 0.3 && y < 0.36 ? hex("#e8b27a") : hex("#c4693a")), 0.08, 21);
-  pot.material = vcolMat(scene, "pot-mat", { spec: 0.15 });
+    [0, 0], [0.2, 0], [0.27, 0.07], [0.3, 0.2], [0.29, 0.3], [0.22, 0.42], [0.15, 0.5], // body + neck
+    [0.2, 0.55], [0.18, 0.585], [0.13, 0.58], // rolled lip
+    [0.115, 0.54], [0.105, 0.47], [0, 0.45], // inner wall + floor
+  ].map(([x, y]) => new Vector3(x, y, 0));
+  const pot = MeshBuilder.CreateLathe("pot", { shape: profile, tessellation: 16, sideOrientation: Mesh.FRONTSIDE }, scene);
+  const pos = pot.getVerticesData(VertexBuffer.PositionKind)!;
+  const n = pos.length / 3;
+  const col = new Float32Array(n * 4);
+  const clay = hex("#c4693a"), rim = hex("#b05a31"), inside = hex("#2e170f");
+  for (let v = 0; v < n; v++) {
+    const x = pos[v * 3], y = pos[v * 3 + 1], z = pos[v * 3 + 2];
+    const r = Math.hypot(x, z);
+    let c: Color3;
+    if (y > 0.44 && r < 0.12) {
+      // interior: dark at the floor, shading up to the rim colour at the top of the inner wall
+      const t = Math.min(1, Math.max(0, (y - 0.45) / 0.13));
+      c = Color3.Lerp(inside, rim, t * t);
+    } else if (y > 0.52) c = rim;
+    else c = clay;
+    col.set([c.r, c.g, c.b, 1], v * 4);
+  }
+  pot.setVerticesData(VertexBuffer.ColorKind, col);
+  pot.material = vcolMat(scene, "pot-mat", { spec: 0.06 });
   return pot;
 }
 
