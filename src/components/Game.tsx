@@ -7,7 +7,7 @@ import { useGameStore } from "@/game/store";
 import type { InputState } from "@/game/types";
 import Hud from "./Hud";
 
-const KEYMAP: Record<string, keyof Omit<InputState, "attack">> = {
+const KEYMAP: Record<string, "up" | "down" | "left" | "right"> = {
   KeyW: "up",
   ArrowUp: "up",
   KeyS: "down",

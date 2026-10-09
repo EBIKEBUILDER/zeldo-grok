@@ -9,6 +9,9 @@ export interface InputState {
   right: boolean;
   /** edge-triggered: set true on key/click press, consumed by the sim */
   attack: boolean;
+  /** optional analog stick (touch joystick), each −1..1; used when no digital key is held */
+  mx?: number;
+  my?: number;
 }
 
 export interface Player {
@@ -35,7 +38,7 @@ export interface Player {
   doorLock: boolean;
 }
 
-export type EnemyState = "idle" | "wander" | "chase" | "windup" | "lunge" | "stunned" | "spitWindup" | "recover";
+export type EnemyState = "idle" | "wander" | "chase" | "return" | "windup" | "lunge" | "stunned" | "spitWindup" | "recover";
 
 export interface Enemy {
   id: number;
@@ -68,6 +71,16 @@ export interface Enemy {
   farT: number;
   /** boss: hits landed in the current stun window */
   stunHits: number;
+  /** chase bookkeeping: seconds without progress, progress sample timer/position */
+  stuckT: number;
+  sampleT: number;
+  sampleX: number;
+  sampleY: number;
+  /** after giving up, ignore the player for a moment */
+  aggroCd: number;
+  /** walking home: tile indices on the current map, and the next index to visit */
+  path: number[];
+  pathI: number;
 }
 
 /** An arcing gloom glob in flight from (x0,y0) to its marked landing spot (tx,ty). */
@@ -136,6 +149,8 @@ export type EventType =
   | "bossStun"
   | "spit"
   | "splash"
+  | "globLand"
+  | "bossCharge"
   | "door"
   | "gameover"
   | "victory";
@@ -171,6 +186,10 @@ export interface GameState {
   rng: number;
   nextId: number;
   eventSeq: number;
+  /** bumps whenever obstacles change (pot broken) so cached flow fields rebuild */
+  worldVersion: number;
+  /** 1 = visited. [0..5] overworld screens (row-major 3×2), [6] antechamber, [7] warden's hall */
+  explored: number[];
   /** monotonic message counter (never resets while the page lives; carried across retries) */
   msgSeq: number;
   player: Player;

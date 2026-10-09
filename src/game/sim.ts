@@ -4,6 +4,7 @@
  */
 import * as C from "./constants";
 import { mulberry } from "./rng";
+import { FIELD_MIN_TICKS, astar, buildField, canStep, descend, fieldAt, type Blocked, type FlowField } from "./path";
 import type { Breakable, Enemy, EventType, GameState, Glob, InputState, Pickup, Player, Puddle } from "./types";
 import {
   BREAKABLES,
@@ -60,6 +61,13 @@ export function createInitialState(seed = 12345): GameState {
       spitCd: 2.5,
       farT: 0,
       stunHits: 0,
+      stuckT: 0,
+      sampleT: 0,
+      sampleX: s.x,
+      sampleY: s.y,
+      aggroCd: 0,
+      path: [],
+      pathI: 0,
     };
   });
   const breakables: Breakable[] = BREAKABLES.map((b) => ({ id: id++, kind: b.kind, map: b.map, x: b.x, y: b.y, alive: true }));
@@ -92,6 +100,8 @@ export function createInitialState(seed = 12345): GameState {
     nextId: id,
     eventSeq: 0,
     msgSeq: 0,
+    worldVersion: 0,
+    explored: [0, 0, 0, 0, 1, 0, 0, 0],
     player,
     enemies,
     pickups: [],
@@ -284,10 +294,20 @@ function updatePlayer(s: GameState, input: InputState, dt: number) {
 
   let ix = (input.right ? 1 : 0) - (input.left ? 1 : 0);
   let iy = (input.down ? 1 : 0) - (input.up ? 1 : 0);
-  const il = len(ix, iy);
+  let il = len(ix, iy);
+  let throttle = 1;
   if (il > 0) {
     ix /= il;
     iy /= il;
+  } else if (input.mx !== undefined && input.my !== undefined) {
+    // analog stick: direction is free, speed scales with deflection past a dead zone
+    const m = Math.min(1, len(input.mx, input.my));
+    if (m > 0.18) {
+      ix = input.mx / len(input.mx, input.my);
+      iy = input.my / len(input.mx, input.my);
+      il = 1;
+      throttle = Math.min(1, (m - 0.18) / 0.62 + 0.25);
+    }
   }
 
   if (p.knockT > 0) {
@@ -297,7 +317,7 @@ function updatePlayer(s: GameState, input: InputState, dt: number) {
     p.vy *= f;
   } else {
     const swinging = p.swingT > 0;
-    const max = C.PLAYER_MAX_SPEED * (swinging ? 0.45 : 1);
+    const max = C.PLAYER_MAX_SPEED * (swinging ? 0.45 : 1) * throttle;
     const tx = ix * max, ty = iy * max;
     let dvx = tx - p.vx, dvy = ty - p.vy;
     const dl = len(dvx, dvy);
@@ -309,8 +329,10 @@ function updatePlayer(s: GameState, input: InputState, dt: number) {
     p.vx += dvx;
     p.vy += dvy;
     if (il > 0 && !swinging) {
-      p.fx = ix;
-      p.fy = iy;
+      // facing is always one of 8 directions
+      const a = Math.round(Math.atan2(iy, ix) / (Math.PI / 4)) * (Math.PI / 4);
+      p.fx = Math.abs(Math.cos(a)) < 1e-9 ? 0 : Math.cos(a);
+      p.fy = Math.abs(Math.sin(a)) < 1e-9 ? 0 : Math.sin(a);
     }
   }
 
@@ -363,6 +385,7 @@ function swordHits(s: GameState) {
     if (d > 0.4 && angleDiff(Math.atan2(dy, dx), a) > C.SWING_HALF_ARC) continue;
     p.hitIds.push(b.id);
     b.alive = false;
+    s.worldVersion++;
     if (b.kind === "tuft") {
       emit(s, "tuft", b.map, b.x, b.y);
       rollDrop(s, b.map, b.x, b.y, 0.22, 0.12);
@@ -423,6 +446,11 @@ function hitBoss(s: GameState, e: Enemy, dx: number, dy: number) {
   e.guardCd = C.BOSS_GUARD;
   e.state = "windup";
   e.stateT = C.BOSS_COUNTER_WINDUP;
+  const px = s.player.x - e.x, py = s.player.y - e.y;
+  const pl = len(px, py) || 1;
+  e.wx = px / pl;
+  e.wy = py / pl;
+  emit(s, "bossCharge", e.map, e.x, e.y, e.wx, e.wy);
 }
 
 function killEnemy(s: GameState, e: Enemy) {
@@ -480,6 +508,214 @@ function dungeonTriggers(s: GameState) {
   }
 }
 
+
+// ───────────────────────────── navigation ─────────────────────────────
+/** Pots block the flow field (they're solid); everything else comes from the tile map. */
+function navBlocked(s: GameState, map: MapId): Blocked {
+  const pots = new Set<number>();
+  const w = MAPS[map].w;
+  for (const b of s.breakables) if (b.alive && b.kind === "pot" && b.map === map) pots.add(Math.floor(b.y) * w + Math.floor(b.x));
+  return (tx, ty) => solidAt(s, map, tx, ty) || pots.has(ty * w + tx);
+}
+
+interface FieldCache {
+  key: string;
+  tick: number;
+  field: FlowField;
+  blocked: Blocked;
+}
+const fieldCache = new WeakMap<GameState, Partial<Record<MapId, FieldCache>>>();
+
+/** Shared flow field toward the player for `map`; rebuilt on player tile/world change, rate-capped. */
+export function playerField(s: GameState, map: MapId): FieldCache {
+  let c = fieldCache.get(s);
+  if (!c) fieldCache.set(s, (c = {}));
+  const p = s.player;
+  const ptx = Math.floor(p.x), pty = Math.floor(p.y);
+  const key = `${p.map === map ? `${ptx},${pty}` : "none"}|${gateClosed(s) ? 1 : 0}|${s.worldVersion}`;
+  const cur = c[map];
+  if (cur && (cur.key === key || s.tick - cur.tick < FIELD_MIN_TICKS)) return cur;
+  const m = MAPS[map];
+  const blocked = navBlocked(s, map);
+  const field = p.map === map ? buildField(m.w, m.h, blocked, ptx, pty) : buildField(m.w, m.h, blocked, -1, -1);
+  return (c[map] = { key, tick: s.tick, field, blocked });
+}
+
+/** Is a straight walk from a→b clear for a body of half-size r (samples every ¼ tile)? */
+function clearWalk(s: GameState, map: MapId, ax: number, ay: number, bx: number, by: number, r: number): boolean {
+  const d = len(bx - ax, by - ay);
+  const n = Math.max(1, Math.ceil(d / 0.25));
+  for (let i = 1; i <= n; i++) {
+    const t = i / n;
+    if (boxHitsSolid(s, map, ax + (bx - ax) * t, ay + (by - ay) * t, r)) return false;
+  }
+  return true;
+}
+
+const steerOut = { x: 0, y: 0 };
+/**
+ * Steering toward the player: go straight if the corridor is clear, otherwise follow the flow field
+ * downhill and aim for the furthest tile on that chain we can walk to in a straight line (path
+ * smoothing). Returns null when there is no path.
+ */
+export function steerToPlayer(s: GameState, e: Enemy): { x: number; y: number } | null {
+  const p = s.player;
+  const r = e.r * 0.85;
+  if (len(p.x - e.x, p.y - e.y) < 7 && clearWalk(s, e.map, e.x, e.y, p.x, p.y, r * 0.9)) {
+    steerOut.x = p.x;
+    steerOut.y = p.y;
+    return steerOut;
+  }
+  const fc = playerField(s, e.map);
+  let tx = Math.floor(e.x), ty = Math.floor(e.y);
+  if (fieldAt(fc.field, tx, ty) === Infinity) {
+    // standing on a tile edge / inside a blocked cell: try neighbours
+    let found = false;
+    for (const [dx, dy] of [[1, 0], [-1, 0], [0, 1], [0, -1]]) {
+      if (fieldAt(fc.field, tx + dx, ty + dy) < Infinity) {
+        tx += dx;
+        ty += dy;
+        found = true;
+        break;
+      }
+    }
+    if (!found) return null;
+  }
+  let bx = tx + 0.5, by = ty + 0.5;
+  let first = true;
+  for (let k = 0; k < 8; k++) {
+    const nxt = descend(fc.field, fc.blocked, tx, ty);
+    if (!nxt) break;
+    [tx, ty] = nxt;
+    if (first || clearWalk(s, e.map, e.x, e.y, tx + 0.5, ty + 0.5, r * 0.9)) {
+      bx = tx + 0.5;
+      by = ty + 0.5;
+    } else break;
+    first = false;
+  }
+  if (e.r > 0.6) {
+    // big bodies (the Warden) don't fit a tile: nudge the waypoint away from walls beside it so a
+    // 2-tile corridor is usable (the body hugs the far side instead of grinding on the near edge)
+    const cx = Math.floor(bx), cy = Math.floor(by);
+    const blk = (x: number, y: number) => fc.blocked(x, y);
+    const off = e.r - 0.5 + 0.05;
+    if (blk(cx + 1, cy) && !blk(cx - 1, cy)) bx -= off;
+    else if (blk(cx - 1, cy) && !blk(cx + 1, cy)) bx += off;
+    if (blk(cx, cy + 1) && !blk(cx, cy - 1)) by -= off;
+    else if (blk(cx, cy - 1) && !blk(cx, cy + 1)) by += off;
+  }
+  steerOut.x = bx;
+  steerOut.y = by;
+  return steerOut;
+}
+
+function startReturn(s: GameState, e: Enemy) {
+  e.state = "return";
+  e.aggroCd = C.BLOB_REAGGRO_CD;
+  e.stuckT = 0;
+  const m = MAPS[e.map];
+  const path = astar(m.w, m.h, navBlocked(s, e.map), Math.floor(e.x), Math.floor(e.y), Math.floor(e.homeX), Math.floor(e.homeY));
+  e.path = path ?? [];
+  e.pathI = 0;
+}
+
+function blobBrain(s: GameState, e: Enemy, dt: number, d: number, samePlace: boolean) {
+  const p = s.player;
+  e.aggroCd = Math.max(0, e.aggroCd - dt);
+  const playerSafe = inSanctuary(p.map, p.x, p.y);
+  let tx = 0, ty = 0;
+  const homeD = len(e.x - e.homeX, e.y - e.homeY);
+
+  if (e.state === "chase") {
+    if (!samePlace || s.phase !== "playing" || d > C.BLOB_DEAGGRO || homeD > C.BLOB_LEASH) startReturn(s, e);
+    else {
+      // progress check once a second: moved meaningfully, or already brawling
+      e.sampleT += dt;
+      if (e.sampleT >= 1) {
+        const moved = len(e.x - e.sampleX, e.y - e.sampleY);
+        const brawling = d < e.r + C.PLAYER_R + 0.6;
+        if (moved > 0.5 || brawling) e.stuckT = 0;
+        else e.stuckT += e.sampleT;
+        e.sampleT = 0;
+        e.sampleX = e.x;
+        e.sampleY = e.y;
+      }
+      const goal = steerToPlayer(s, e);
+      if (e.stuckT >= C.BLOB_GIVEUP) startReturn(s, e);
+      else if (goal) {
+        const gx = goal.x - e.x, gy = goal.y - e.y;
+        const gl = len(gx, gy) || 1;
+        tx = (gx / gl) * C.BLOB_SPEED;
+        ty = (gy / gl) * C.BLOB_SPEED;
+      }
+    }
+  }
+  if (e.state === "return") {
+    if (e.pathI < e.path.length) {
+      const w = MAPS[e.map].w;
+      // smoothing: skip ahead to the furthest waypoint we can walk to directly
+      let target = e.pathI;
+      for (let k = e.pathI + 1; k < Math.min(e.path.length, e.pathI + 5); k++) {
+        const c = e.path[k];
+        if (clearWalk(s, e.map, e.x, e.y, (c % w) + 0.5, Math.floor(c / w) + 0.5, e.r * 0.8)) target = k;
+      }
+      e.pathI = target;
+      const c = e.path[e.pathI];
+      const wx = (c % w) + 0.5 - e.x, wy = Math.floor(c / w) + 0.5 - e.y;
+      const wl = len(wx, wy);
+      if (wl < 0.35) e.pathI++;
+      else {
+        tx = (wx / wl) * 1.6;
+        ty = (wy / wl) * 1.6;
+      }
+    } else {
+      const hx = e.homeX - e.x, hy = e.homeY - e.y;
+      const hl = len(hx, hy);
+      if (hl < 0.4) {
+        e.state = "idle";
+        e.stateT = 1;
+      } else {
+        tx = (hx / hl) * 1.6;
+        ty = (hy / hl) * 1.6;
+      }
+    }
+  }
+  if (e.state !== "chase" && e.state !== "return") {
+    const sees = samePlace && d < C.BLOB_AGGRO && (d < 2.5 || clearWalk(s, e.map, e.x, e.y, p.x, p.y, 0.05));
+    if (s.phase === "playing" && !playerSafe && e.aggroCd <= 0 && sees) {
+      e.state = "chase";
+      e.stuckT = 0;
+      e.sampleT = 0;
+      e.sampleX = e.x;
+      e.sampleY = e.y;
+    } else {
+      e.stateT -= dt;
+      if (e.stateT <= 0) {
+        if (homeD > 3.5) {
+          e.state = "wander";
+          e.wx = (e.homeX - e.x) / homeD;
+          e.wy = (e.homeY - e.y) / homeD;
+        } else if (rand(s) < 0.4) {
+          e.state = "idle";
+        } else {
+          e.state = "wander";
+          const a = rand(s) * Math.PI * 2;
+          e.wx = Math.cos(a);
+          e.wy = Math.sin(a);
+        }
+        e.stateT = 0.9 + rand(s) * 1.6;
+      }
+      if (e.state === "wander") {
+        tx = e.wx * 1.0;
+        ty = e.wy * 1.0;
+      }
+    }
+  }
+  const k = Math.min(1, 8 * dt);
+  e.vx += (tx - e.vx) * k;
+  e.vy += (ty - e.vy) * k;
+}
+
 // ───────────────────────────── enemies ─────────────────────────────
 function updateEnemies(s: GameState, dt: number) {
   const p = s.player;
@@ -530,46 +766,8 @@ function updateEnemies(s: GameState, dt: number) {
         continue;
       }
     } else {
-      const playerSafe = inSanctuary(p.map, p.x, p.y);
-      const aggro = samePlace && s.phase === "playing" && !playerSafe && d < C.BLOB_AGGRO;
-      let tx = 0, ty = 0;
-      if (aggro) {
-        e.state = "chase";
-        tx = (dx / d) * C.BLOB_SPEED;
-        ty = (dy / d) * C.BLOB_SPEED;
-      } else {
-        if (e.state === "chase") {
-          e.state = "idle";
-          e.stateT = 0.8;
-        }
-        e.stateT -= dt;
-        if (e.stateT <= 0) {
-          const hx = e.homeX - e.x, hy = e.homeY - e.y;
-          const hd = len(hx, hy);
-          if (hd > 3.5) {
-            e.state = "wander";
-            e.wx = hx / hd;
-            e.wy = hy / hd;
-          } else if (rand(s) < 0.4) {
-            e.state = "idle";
-          } else {
-            e.state = "wander";
-            const a = rand(s) * Math.PI * 2;
-            e.wx = Math.cos(a);
-            e.wy = Math.sin(a);
-          }
-          e.stateT = 0.9 + rand(s) * 1.6;
-        }
-        if (e.state === "wander") {
-          tx = e.wx * 1.0;
-          ty = e.wy * 1.0;
-        }
-      }
-      const k = Math.min(1, 8 * dt);
-      e.vx += (tx - e.vx) * k;
-      e.vy += (ty - e.vy) * k;
+      blobBrain(s, e, dt, d, samePlace);
     }
-
     const blocked = moveBody(s, e, e.vx * dt, e.vy * dt, e.r * 0.85);
     if (blocked.bx || blocked.by) {
       if (e.state === "wander") e.stateT = 0;
@@ -662,11 +860,19 @@ function updateBoss(s: GameState, e: Enemy, dt: number, dx: number, dy: number, 
     default: {
       e.state = "chase";
       const sp = C.BOSS_SPEED * (enraged ? 1.15 : 1);
-      tx = nx * sp;
-      ty = ny * sp;
+      const goal = steerToPlayer(s, e);
+      if (goal) {
+        const gx = goal.x - e.x, gy = goal.y - e.y;
+        const gl = len(gx, gy) || 1;
+        tx = (gx / gl) * sp;
+        ty = (gy / gl) * sp;
+      }
       if (e.lungeCd <= 0 && canLunge && d > 1.6) {
         e.state = "windup";
-        e.stateT = enraged ? 0.5 : C.BOSS_WINDUP;
+        e.stateT = enraged ? 0.65 : C.BOSS_WINDUP;
+        e.wx = nx;
+        e.wy = ny;
+        emit(s, "bossCharge", e.map, e.x, e.y, nx, ny);
       } else if (e.spitCd <= 0 && (d >= C.BOSS_LUNGE_RANGE || e.farT > 1.2)) {
         // the player is kiting or hiding behind a pillar: flush them out
         e.state = "spitWindup";
@@ -702,17 +908,24 @@ function fireGlobs(s: GameState, e: Enemy, n: number) {
   emit(s, "spit", e.map, e.x, e.y, 1, 0);
 }
 
+/** Burst hit test: the hero's centre within splash radius + half their body. */
+export function globHits(px: number, py: number, gx: number, gy: number): boolean {
+  return len(px - gx, py - gy) < C.GLOB_SPLASH_R + C.PLAYER_R * 0.5;
+}
+
 function updateHazards(s: GameState, dt: number) {
   const p = s.player;
   const keep: Glob[] = [];
   for (const g of s.globs) {
+    const wasFlying = g.t < g.dur;
     g.t += dt;
-    if (g.t < g.dur) {
+    if (wasFlying && g.t >= g.dur) emit(s, "globLand", "dungeon", g.tx, g.ty);
+    if (g.t < g.dur + C.GLOB_FUSE) {
       keep.push(g);
       continue;
     }
     emit(s, "splash", "dungeon", g.tx, g.ty);
-    if (p.map === "dungeon" && len(p.x - g.tx, p.y - g.ty) < C.GLOB_SPLASH_R + C.PLAYER_R) hurtPlayer(s, C.GLOB_DMG, g.tx, g.ty);
+    if (p.map === "dungeon" && globHits(p.x, p.y, g.tx, g.ty)) hurtPlayer(s, C.GLOB_DMG, g.tx, g.ty);
     s.puddles.push({ id: s.nextId++, x: g.tx, y: g.ty, r: C.PUDDLE_R, life: C.PUDDLE_LIFE, max: C.PUDDLE_LIFE });
   }
   s.globs = keep;
@@ -847,7 +1060,17 @@ export function stepGame(s: GameState, input: InputState, dt = C.DT): GameState 
     if (s.message.t <= 0) s.message = null;
   }
   s.area = areaName(s.player.map, s.player.x, s.player.y);
+  markExplored(s);
   return s;
+}
+
+export function markExplored(s: GameState) {
+  const p = s.player;
+  if (p.map === "over") {
+    const sx = Math.min(2, Math.max(0, Math.floor(p.x / C.SCREEN_W)));
+    const sy = Math.min(1, Math.max(0, Math.floor(p.y / C.SCREEN_H)));
+    s.explored[sy * 3 + sx] = 1;
+  } else s.explored[p.y < GATE_ROW + 0.5 ? 7 : 6] = 1;
 }
 
 export function startGame(s: GameState): GameState {

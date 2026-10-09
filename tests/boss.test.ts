@@ -114,14 +114,14 @@ describe("Gloomgulp", () => {
     s.player.invuln = 0;
     s.player.x = g.tx + GLOB_SPLASH_R + PLAYER_R + 0.6; s.player.y = g.ty;
     const hp = s.player.hp;
-    for (let i = 0; i < 100 && s.globs.length; i++) { s.player.x = g.tx + GLOB_SPLASH_R + PLAYER_R + 0.6; s.player.y = g.ty; b.state = "stunned"; b.stateT = 9; stepGame(s, idle()); }
+    for (let i = 0; i < 200 && s.globs.length; i++) { s.player.x = g.tx + GLOB_SPLASH_R + PLAYER_R + 0.6; s.player.y = g.ty; b.state = "stunned"; b.stateT = 9; stepGame(s, idle()); }
     expect(s.player.hp).toBe(hp);
     expect(s.puddles.length).toBe(1);
     // a second glob onto a player who stays inside the ring
     s.puddles = [];
     s.globs = [{ ...g, id: 999, t: 0 }];
     s.player.x = g.tx + 0.5; s.player.y = g.ty;
-    for (let i = 0; i < 100 && s.globs.length; i++) { s.player.x = g.tx + 0.5; s.player.y = g.ty; stepGame(s, idle()); }
+    for (let i = 0; i < 200 && s.globs.length; i++) { s.player.x = g.tx + 0.5; s.player.y = g.ty; stepGame(s, idle()); }
     expect(s.player.hp).toBeLessThan(hp);
   });
 
