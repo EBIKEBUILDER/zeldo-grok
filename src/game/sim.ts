@@ -4,7 +4,7 @@
  */
 import * as C from "./constants";
 import { mulberry } from "./rng";
-import type { Breakable, Enemy, EventType, GameState, InputState, Pickup, Player } from "./types";
+import type { Breakable, Enemy, EventType, GameState, Glob, InputState, Pickup, Player, Puddle } from "./types";
 import {
   BREAKABLES,
   BOSS_TRIGGER_Y,
@@ -55,7 +55,11 @@ export function createInitialState(seed = 12345): GameState {
       stun: 0,
       contactCd: 0,
       respawnT: 0,
-      lungeCd: 2.5,
+      lungeCd: 1.2,
+      guardCd: 0,
+      spitCd: 2.5,
+      farT: 0,
+      stunHits: 0,
     };
   });
   const breakables: Breakable[] = BREAKABLES.map((b) => ({ id: id++, kind: b.kind, map: b.map, x: b.x, y: b.y, alive: true }));
@@ -91,6 +95,8 @@ export function createInitialState(seed = 12345): GameState {
     enemies,
     pickups: [],
     breakables,
+    globs: [],
+    puddles: [],
     flags: { hasKey: false, gateOpen: false, bossAwake: false, bossDefeated: false, chestOpened: false },
     message: null,
     area: areaName("over", SPAWN.x, SPAWN.y),
@@ -367,18 +373,55 @@ function swordHits(s: GameState) {
 }
 
 function hitEnemy(s: GameState, e: Enemy, dx: number, dy: number) {
+  if (e.kind === "boss") return hitBoss(s, e, dx, dy);
   e.hp -= 1;
   e.hitFlash = 0.14;
-  e.stun = e.kind === "boss" ? 0.22 : 0.32;
-  const kb = e.kind === "boss" ? 6 : 10;
+  e.stun = 0.32;
+  const kb = 10;
   e.vx = dx * kb;
   e.vy = dy * kb;
-  if (e.kind === "boss" && (e.state === "windup" || e.state === "lunge")) {
-    e.state = "recover";
-    e.stateT = 0.4;
-  }
   emit(s, "hit", e.map, e.x, e.y, dx, dy);
   if (e.hp <= 0) killEnemy(s, e);
+}
+
+/** True when the boss's armor is up: sword hits clank off harmlessly. */
+export function bossArmored(e: Enemy): boolean {
+  return e.state === "windup" || e.state === "lunge" || e.state === "spitWindup" || (e.state !== "stunned" && e.guardCd > 0);
+}
+
+/**
+ * Gloomgulp's damage rules:
+ *  - stunned (after a lunge): full damage, no knockback — the reward window.
+ *  - windup / lunge / spit tell / guarded: CLANK — no damage, no knockback, nothing interrupts him.
+ *  - otherwise (chasing): one glancing hit lands, then he guards and counter-lunges at point blank.
+ */
+function hitBoss(s: GameState, e: Enemy, dx: number, dy: number) {
+  if (e.state === "stunned") {
+    e.hp -= 1;
+    e.hitFlash = 0.14;
+    e.stunHits++;
+    emit(s, "hit", e.map, e.x, e.y, dx, dy);
+    if (e.hp <= 0) return killEnemy(s, e);
+    if (e.stunHits >= C.BOSS_STUN_MAX_HITS) {
+      // jolted awake — back off!
+      e.state = "recover";
+      e.stateT = 0.35;
+      e.guardCd = 0.6;
+      e.lungeCd = C.BOSS_LUNGE_CD;
+    }
+    return;
+  }
+  if (bossArmored(e)) {
+    emit(s, "clank", e.map, e.x - dx * e.r * 0.8, e.y - dy * e.r * 0.8, dx, dy);
+    return;
+  }
+  e.hp -= 1;
+  e.hitFlash = 0.14;
+  emit(s, "hit", e.map, e.x, e.y, dx, dy);
+  if (e.hp <= 0) return killEnemy(s, e);
+  e.guardCd = C.BOSS_GUARD;
+  e.state = "windup";
+  e.stateT = C.BOSS_COUNTER_WINDUP;
 }
 
 function killEnemy(s: GameState, e: Enemy) {
@@ -386,6 +429,8 @@ function killEnemy(s: GameState, e: Enemy) {
   e.vx = e.vy = 0;
   if (e.kind === "boss") {
     s.flags.bossDefeated = true;
+    s.globs = [];
+    s.puddles = [];
     emit(s, "bossDie", e.map, e.x, e.y);
     emit(s, "chestAppear", e.map, CHEST.x, CHEST.y);
     spawnPickup(s, "heart", e.map, e.x, e.y);
@@ -468,6 +513,21 @@ function updateEnemies(s: GameState, dt: number) {
       e.vy *= f;
     } else if (e.kind === "boss") {
       updateBoss(s, e, dt, dx, dy, d);
+      if (e.state === "lunge") {
+        const before = { x: e.x, y: e.y };
+        const b = moveBody(s, e, e.vx * dt, e.vy * dt, e.r * 0.85);
+        const moved = len(e.x - before.x, e.y - before.y);
+        if ((b.bx || b.by) && moved < C.BOSS_LUNGE_SPEED * dt * 0.5) {
+          // slammed into a wall/pillar: dazed for longer
+          e.state = "stunned";
+          e.stateT = C.BOSS_BONK_STUN;
+          e.stunHits = 0;
+          e.vx = e.vy = 0;
+          emit(s, "bossStun", e.map, e.x, e.y, e.wx, e.wy);
+        }
+        pushOutOfCircles(s, e, e.r * 0.85, staticCircles(s, e.map));
+        continue;
+      }
     } else {
       const playerSafe = inSanctuary(p.map, p.x, p.y);
       const aggro = samePlace && s.phase === "playing" && !playerSafe && d < C.BLOB_AGGRO;
@@ -524,32 +584,75 @@ function updateEnemies(s: GameState, dt: number) {
   }
 }
 
+function hasLineOfSight(s: GameState, map: MapId, x0: number, y0: number, x1: number, y1: number): boolean {
+  const d = len(x1 - x0, y1 - y0);
+  const n = Math.ceil(d / 0.25);
+  for (let i = 1; i < n; i++) {
+    const t = i / n;
+    if (solidAt(s, map, Math.floor(x0 + (x1 - x0) * t), Math.floor(y0 + (y1 - y0) * t))) return false;
+  }
+  return true;
+}
+
 function updateBoss(s: GameState, e: Enemy, dt: number, dx: number, dy: number, d: number) {
   const f = s.flags;
+  const p = s.player;
   if (!f.bossAwake) {
     e.vx = e.vy = 0;
     return;
   }
   e.stateT -= dt;
   e.lungeCd -= dt;
+  e.spitCd -= dt;
+  e.guardCd = Math.max(0, e.guardCd - dt);
+  const enraged = e.hp <= e.maxHp / 2;
   const nx = dx / (d || 1), ny = dy / (d || 1);
+  const canLunge = d < C.BOSS_LUNGE_RANGE && hasLineOfSight(s, e.map, e.x, e.y, p.x, p.y);
+  e.farT = canLunge ? 0 : e.farT + dt;
   let tx = 0, ty = 0;
+  let accel = 6;
   switch (e.state) {
     case "windup":
-      if (e.stateT <= 0) {
-        e.state = "lunge";
-        e.stateT = 0.42;
+      // planted and shuddering; tracks the player until the aim locks just before release
+      if (e.stateT > C.BOSS_AIM_LOCK) {
         e.wx = nx;
         e.wy = ny;
+      }
+      if (e.stateT <= 0) {
+        e.state = "lunge";
+        e.stateT = C.BOSS_LUNGE_TIME;
         emit(s, "lunge", e.map, e.x, e.y, nx, ny);
+        e.vx = e.wx * C.BOSS_LUNGE_SPEED;
+        e.vy = e.wy * C.BOSS_LUNGE_SPEED;
       }
       break;
     case "lunge":
-      tx = e.wx * 10;
-      ty = e.wy * 10;
+      // freight train: fixed heading, full speed, nothing interrupts it
+      e.vx = e.wx * C.BOSS_LUNGE_SPEED;
+      e.vy = e.wy * C.BOSS_LUNGE_SPEED;
+      if (e.stateT <= 0) {
+        e.state = "stunned";
+        e.stateT = C.BOSS_STUN;
+        e.stunHits = 0;
+        e.vx = e.vy = 0;
+        emit(s, "bossStun", e.map, e.x, e.y);
+      }
+      return;
+    case "stunned":
+      accel = 10;
       if (e.stateT <= 0) {
         e.state = "recover";
-        e.stateT = 0.55;
+        e.stateT = 0.3;
+        e.guardCd = 0;
+        e.lungeCd = C.BOSS_LUNGE_CD;
+      }
+      break;
+    case "spitWindup":
+      if (e.stateT <= 0) {
+        fireGlobs(s, e, enraged ? 5 : 3);
+        e.state = "recover";
+        e.stateT = 0.5;
+        e.spitCd = C.BOSS_SPIT_CD;
       }
       break;
     case "recover":
@@ -557,20 +660,69 @@ function updateBoss(s: GameState, e: Enemy, dt: number, dx: number, dy: number, 
       break;
     default: {
       e.state = "chase";
-      const enraged = e.hp <= e.maxHp / 2;
-      const sp = C.BOSS_SPEED * (enraged ? 1.2 : 1);
+      const sp = C.BOSS_SPEED * (enraged ? 1.15 : 1);
       tx = nx * sp;
       ty = ny * sp;
-      if (e.lungeCd <= 0 && d < 7 && d > 1.8) {
+      if (e.lungeCd <= 0 && canLunge && d > 1.6) {
         e.state = "windup";
-        e.stateT = enraged ? 0.4 : 0.6;
-        e.lungeCd = enraged ? 2.2 : 3.2;
+        e.stateT = enraged ? 0.5 : C.BOSS_WINDUP;
+      } else if (e.spitCd <= 0 && (d >= C.BOSS_LUNGE_RANGE || e.farT > 1.2)) {
+        // the player is kiting or hiding behind a pillar: flush them out
+        e.state = "spitWindup";
+        e.stateT = C.BOSS_SPIT_WINDUP;
+        emit(s, "spit", e.map, e.x, e.y);
       }
     }
   }
-  const k = Math.min(1, (e.state === "lunge" ? 30 : 6) * dt);
+  const k = Math.min(1, accel * dt);
   e.vx += (tx - e.vx) * k;
   e.vy += (ty - e.vy) * k;
+}
+
+/** Lob a volley: one glob at where the player is heading, the rest bracketing them. */
+function fireGlobs(s: GameState, e: Enemy, n: number) {
+  const p = s.player;
+  const lead = 0.45;
+  const ax = p.x + p.vx * lead, ay = p.y + p.vy * lead;
+  for (let i = 0; i < n; i++) {
+    let tx = ax, ty = ay;
+    if (i > 0) {
+      const a = ((i - 1) / (n - 1)) * Math.PI * 2 + rand(s) * 0.8;
+      const r = 1.7 + rand(s) * 0.6;
+      tx += Math.cos(a) * r;
+      ty += Math.sin(a) * r;
+    }
+    // keep landing spots on open floor
+    tx = Math.max(1.3, Math.min(14.7, tx));
+    ty = Math.max(1.3, Math.min(GATE_ROW - 0.3, ty));
+    const g: Glob = { id: s.nextId++, x0: e.x, y0: e.y, tx, ty, t: 0, dur: C.GLOB_FLIGHT + i * 0.12 };
+    s.globs.push(g);
+  }
+  emit(s, "spit", e.map, e.x, e.y, 1, 0);
+}
+
+function updateHazards(s: GameState, dt: number) {
+  const p = s.player;
+  const keep: Glob[] = [];
+  for (const g of s.globs) {
+    g.t += dt;
+    if (g.t < g.dur) {
+      keep.push(g);
+      continue;
+    }
+    emit(s, "splash", "dungeon", g.tx, g.ty);
+    if (p.map === "dungeon" && len(p.x - g.tx, p.y - g.ty) < C.GLOB_SPLASH_R + C.PLAYER_R) hurtPlayer(s, C.GLOB_DMG, g.tx, g.ty);
+    s.puddles.push({ id: s.nextId++, x: g.tx, y: g.ty, r: C.PUDDLE_R, life: C.PUDDLE_LIFE, max: C.PUDDLE_LIFE });
+  }
+  s.globs = keep;
+  const pk: Puddle[] = [];
+  for (const q of s.puddles) {
+    q.life -= dt;
+    if (q.life <= 0) continue;
+    if (p.map === "dungeon" && len(p.x - q.x, p.y - q.y) < q.r + C.PLAYER_R * 0.5) hurtPlayer(s, C.GLOB_DMG, q.x, q.y);
+    pk.push(q);
+  }
+  s.puddles = pk;
 }
 
 /** Player and enemies are solid to each other; also handles contact damage. */
@@ -600,7 +752,7 @@ function resolveBodies(s: GameState) {
       if (d < min) {
         const nx = d > 1e-5 ? dx / d : 0, ny = d > 1e-5 ? dy / d : 1;
         const overlap = min - d + 1e-3;
-        const pShare = e.kind === "boss" ? 0.8 : 0.5;
+        const pShare = e.kind === "boss" ? (e.state === "lunge" || e.state === "windup" ? 1 : 0.8) : 0.5;
         const before = { x: p.x, y: p.y };
         moveBody(s, p, nx * overlap * pShare, ny * overlap * pShare, C.PLAYER_R);
         const moved = len(p.x - before.x, p.y - before.y);
@@ -612,9 +764,11 @@ function resolveBodies(s: GameState) {
   for (const e of live) {
     if (e.kind === "boss" && !s.flags.bossAwake) continue;
     const d = len(p.x - e.x, p.y - e.y);
+    if (e.state === "stunned") continue; // dazed boss is harmless to touch
     if (d < C.PLAYER_R + e.r + 0.08 && e.contactCd <= 0 && e.stun <= 0 && p.invuln <= 0) {
       e.contactCd = C.CONTACT_COOLDOWN;
-      hurtPlayer(s, e.kind === "boss" ? 2 : 1, e.x, e.y);
+      const dmg = e.kind !== "boss" ? 1 : e.state === "lunge" ? C.BOSS_LUNGE_DMG : C.BOSS_CONTACT_DMG;
+      hurtPlayer(s, dmg, e.x, e.y);
     }
   }
 }
@@ -684,6 +838,7 @@ export function stepGame(s: GameState, input: InputState, dt = C.DT): GameState 
   updatePlayer(s, input, dt);
   updateEnemies(s, dt);
   resolveBodies(s);
+  updateHazards(s, dt);
   updatePickups(s, dt);
 
   if (s.message) {

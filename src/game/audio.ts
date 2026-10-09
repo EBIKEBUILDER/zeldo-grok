@@ -122,6 +122,24 @@ export class Sfx {
       case "lunge":
         this.noise(0.25, { freq: 400, slide: 1600, vol: 0.25 });
         break;
+      case "clank":
+        this.tone(1760, 0.12, { type: "square", vol: 0.1 });
+        this.tone(2637, 0.18, { type: "square", vol: 0.07, delay: 0.01 });
+        this.noise(0.08, { freq: 5000, q: 2, vol: 0.25, type: "highpass" });
+        break;
+      case "bossStun":
+        this.tone(880, 0.6, { type: "triangle", vol: 0.12, slide: 330 });
+        this.tone(1320, 0.5, { type: "triangle", vol: 0.06, slide: 495, delay: 0.08 });
+        this.noise(0.3, { freq: 200, vol: 0.35, type: "lowpass" });
+        break;
+      case "spit":
+        this.tone(140, 0.35, { type: "sawtooth", vol: 0.1, slide: 420 });
+        this.noise(0.3, { freq: 600, slide: 1600, q: 4, vol: 0.18 });
+        break;
+      case "splash":
+        this.tone(320, 0.25, { type: "sine", vol: 0.22, slide: 70 });
+        this.noise(0.3, { freq: 900, slide: 200, vol: 0.3, type: "lowpass" });
+        break;
       case "chestAppear":
         this.arp([523, 784, 1047], 0.1, { type: "triangle", vol: 0.14 });
         break;

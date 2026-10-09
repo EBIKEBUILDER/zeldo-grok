@@ -35,7 +35,7 @@ export interface Player {
   doorLock: boolean;
 }
 
-export type EnemyState = "idle" | "wander" | "chase" | "windup" | "lunge" | "recover";
+export type EnemyState = "idle" | "wander" | "chase" | "windup" | "lunge" | "stunned" | "spitWindup" | "recover";
 
 export interface Enemy {
   id: number;
@@ -60,6 +60,35 @@ export interface Enemy {
   contactCd: number;
   respawnT: number;
   lungeCd: number;
+  /** boss: after a glancing hit outside the stun window he guards for a moment */
+  guardCd: number;
+  /** boss: cooldown for the ranged glob volley */
+  spitCd: number;
+  /** boss: how long the player has been out of lunge reach */
+  farT: number;
+  /** boss: hits landed in the current stun window */
+  stunHits: number;
+}
+
+/** An arcing gloom glob in flight from (x0,y0) to its marked landing spot (tx,ty). */
+export interface Glob {
+  id: number;
+  x0: number;
+  y0: number;
+  tx: number;
+  ty: number;
+  t: number;
+  dur: number;
+}
+
+/** A short-lived damaging puddle left where a glob burst. */
+export interface Puddle {
+  id: number;
+  x: number;
+  y: number;
+  r: number;
+  life: number;
+  max: number;
 }
 
 export interface Pickup {
@@ -103,6 +132,10 @@ export type EventType =
   | "spawn"
   | "bossRoar"
   | "lunge"
+  | "clank"
+  | "bossStun"
+  | "spit"
+  | "splash"
   | "door"
   | "gameover"
   | "victory";
@@ -142,6 +175,8 @@ export interface GameState {
   enemies: Enemy[];
   pickups: Pickup[];
   breakables: Breakable[];
+  globs: Glob[];
+  puddles: Puddle[];
   flags: Flags;
   message: Message | null;
   area: string;

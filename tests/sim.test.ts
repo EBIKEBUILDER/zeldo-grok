@@ -132,7 +132,7 @@ describe("combat", () => {
 });
 
 describe("quest", () => {
-  it("full loop: door → key → gate → boss → chest → victory", () => {
+  it("full loop: door → key → gate → boss → chest → victory", async () => {
     const s = fresh();
     toDungeon(s);
     expect(s.player.x).toBeCloseTo(DUNGEON_ENTRY.x, 0);
@@ -170,20 +170,10 @@ describe("quest", () => {
     const boss = s.enemies.find((e) => e.kind === "boss")!;
     expect(s.flags.bossDefeated).toBe(false);
 
-    // kill the boss: 8 hits
-    s.player.invuln = 1e9;
-    let swings = 0;
-    while (boss.alive && swings < 200) {
-      s.player.x = boss.x;
-      s.player.y = boss.y + boss.r + 0.9;
-      s.player.fx = 0;
-      s.player.fy = -1;
-      stepGame(s, { ...idle(), attack: true });
-      run(s, {}, 25);
-      swings++;
-    }
+    // fight it like a careful player would
+    const { carefulInput } = await import("./helpers");
+    for (let i = 0; i < 60 * 120 && boss.alive && s.phase === "playing"; i++) stepGame(s, carefulInput(s));
     expect(boss.alive).toBe(false);
-    expect(swings).toBe(8);
     expect(s.flags.bossDefeated).toBe(true);
     expect(gateClosed(s)).toBe(false);
 

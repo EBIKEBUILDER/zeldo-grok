@@ -25,7 +25,7 @@ import {
   VertexData,
   type AbstractMesh,
 } from "@babylonjs/core";
-import { SWING_HALF_ARC, SWING_TIME } from "../constants";
+import { GLOB_SPLASH_R, SWING_HALF_ARC, SWING_TIME } from "../constants";
 import { hash2, makeRng } from "../rng";
 import { chestVisible, gateClosed } from "../sim";
 import type { GameEvent, GameState } from "../types";
@@ -138,6 +138,13 @@ export class GameView {
   private chestLid: TransformNode;
   private chestScale = 0;
   private water: Mesh;
+  private stars: Mesh[] = [];
+  private globBase: Mesh;
+  private ringBase: Mesh;
+  private discBase: Mesh;
+  private puddleBase: Mesh;
+  private globMeshes = new Map<number, { ball: AbstractMesh; ring: AbstractMesh; disc: AbstractMesh }>();
+  private puddleMeshes = new Map<number, AbstractMesh>();
   private particles: Particle[] = [];
   private particleMesh: Mesh;
   private particleMatrices: Float32Array;
@@ -229,6 +236,39 @@ export class GameView {
     const c = this.buildChest();
     this.chestNode = c.node;
     this.chestLid = c.lid;
+
+    // boss: dizzy stars, globs, landing markers, puddles
+    const starMat = material(scene, "star-mat", "#ffe066", { emissive: "#ffcc33" });
+    for (let i = 0; i < 4; i++) {
+      const st = MeshBuilder.CreatePolyhedron("star" + i, { type: 2, size: 0.11 }, scene);
+      st.material = starMat;
+      st.setEnabled(false);
+      this.stars.push(st);
+    }
+    this.globBase = MeshBuilder.CreateIcoSphere("glob", { radius: 0.26, subdivisions: 1 }, scene);
+    paintFacets(this.globBase, hex("#5b2a7a"), 0.2, 91);
+    const gm = material(scene, "glob-mat", "#ffffff", { spec: 0.6 });
+    gm.emissiveColor = hex("#3a7a1a");
+    this.globBase.material = gm;
+    this.globBase.setEnabled(false);
+    this.ringBase = MeshBuilder.CreateTorus("globRing", { diameter: 2, thickness: 0.07, tessellation: 28 }, scene);
+    const rm = material(scene, "ring-mat", "#ff5a7a", { emissive: "#ff2a5a" });
+    rm.disableLighting = true;
+    this.ringBase.material = rm;
+    this.ringBase.setEnabled(false);
+    this.discBase = MeshBuilder.CreateDisc("globDisc", { radius: 1, tessellation: 28 }, scene);
+    this.discBase.rotation.x = Math.PI / 2;
+    this.discBase.bakeCurrentTransformIntoVertices();
+    const dm = material(scene, "disc-mat", "#ff3a6a", { emissive: "#a0103a", alpha: 0.28 });
+    dm.disableLighting = true;
+    this.discBase.material = dm;
+    this.discBase.setEnabled(false);
+    this.puddleBase = MeshBuilder.CreateDisc("puddle", { radius: 1, tessellation: 12 }, scene);
+    this.puddleBase.rotation.x = Math.PI / 2;
+    this.puddleBase.bakeCurrentTransformIntoVertices();
+    const pdm = material(scene, "puddle-mat", "#3b1a52", { emissive: "#4a8a1a", alpha: 0.85, spec: 0.8 });
+    this.puddleBase.material = pdm;
+    this.puddleBase.setEnabled(false);
 
     // particles
     const pm = MeshBuilder.CreateBox("particle", { size: 1 }, scene);
@@ -728,6 +768,7 @@ export class GameView {
     this.syncPickups(state);
     this.syncBreakables(state);
     this.syncDungeon(state, dt);
+    this.syncHazards(state);
     this.updateParticles(dt);
     this.water.position.y = -0.14 + Math.sin(this.time * 1.3) * 0.015;
     this.syncCamera(state, dt);
@@ -840,7 +881,10 @@ export class GameView {
       if (e.alive && !v.wasAlive) v.spawnT = 0;
       v.wasAlive = e.alive;
       v.root.setEnabled(e.alive);
-      if (!e.alive) continue;
+      if (!e.alive) {
+        if (e.kind === "boss") this.stars.forEach((st) => st.setEnabled(false));
+        continue;
+      }
       v.spawnT = Math.min(1, v.spawnT + dt * 3);
       const pos = toWorld(e.map, e.x, e.y);
       v.root.position.copyFrom(pos);
@@ -859,12 +903,31 @@ export class GameView {
       const sp = v.spawnT * (2 - v.spawnT);
       v.mesh.scaling.set((1 - sq * 0.6) * sp, (1 + sq) * sp, (1 - sq * 0.6) * sp);
       // hit flash (white) / windup glow (amber)
+      const pulse = 0.5 + 0.5 * Math.sin(this.time * 14);
       if (e.hitFlash > 0) v.mat.emissiveColor.set(1, 1, 1);
-      else if (e.state === "windup") v.mat.emissiveColor.set(0.6, 0.3, 0.05);
+      else if (e.state === "windup") v.mat.emissiveColor.set(0.55 + pulse * 0.35, 0.28 + pulse * 0.15, 0.03);
+      else if (e.state === "lunge") v.mat.emissiveColor.set(0.7, 0.35, 0.05);
+      else if (e.state === "spitWindup") v.mat.emissiveColor.set(0.15, 0.35 + pulse * 0.3, 0.05);
+      else if (e.state === "stunned") v.mat.emissiveColor.set(0.12, 0.2, 0.45 + pulse * 0.15);
+      else if (e.kind === "boss" && e.guardCd > 0) v.mat.emissiveColor.set(0.22, 0.22, 0.28);
       else if (e.kind === "boss" && !state.flags.bossAwake) v.mat.emissiveColor.set(0, 0, 0.02);
       else v.mat.emissiveColor.set(0, 0, 0);
       v.mesh.position.x = e.state === "windup" ? Math.sin(this.time * 60) * 0.03 : 0;
+      v.mesh.rotation.z = e.state === "stunned" ? Math.sin(this.time * 7) * 0.2 : 0;
+      v.mesh.rotation.x = e.state === "stunned" ? Math.cos(this.time * 7) * 0.12 : e.state === "lunge" ? 0.25 : 0;
+      if (e.state === "stunned") v.mesh.rotation.y = v.yaw + Math.sin(this.time * 3.5) * 0.6;
+      if (e.state === "spitWindup") v.mesh.scaling.set(1.15 + pulse * 0.08, 0.9, 1.15 + pulse * 0.08);
       if (e.kind === "boss" && !state.flags.bossAwake) v.mesh.scaling.y *= 0.92;
+      if (e.kind === "boss") {
+        const dizzy = e.state === "stunned";
+        this.stars.forEach((st, i) => {
+          st.setEnabled(dizzy);
+          if (!dizzy) return;
+          const a = this.time * 4 + (i / this.stars.length) * Math.PI * 2;
+          st.position.set(pos.x + Math.cos(a) * 0.75, 2.05 + Math.sin(a * 2) * 0.08, pos.z + Math.sin(a) * 0.75);
+          st.rotation.y = this.time * 6;
+        });
+      }
     }
   }
 
@@ -927,6 +990,56 @@ export class GameView {
     if (this.currentMap === "dungeon")
       this.roomLights.forEach((l, i) => (l.intensity = 1.2 + Math.sin(this.time * 9 + i) * 0.08 + Math.sin(this.time * 23 + i * 3) * 0.05));
     if (f.chestOpened && Math.random() < 0.4) this.emit(CHEST.x, CHEST.y, "dungeon", 1, { c: hex("#ffe27a"), speed: 1, up: 3, g: -1, life: 1.2, size: 0.07 });
+  }
+
+  private syncHazards(state: GameState) {
+    const seen = new Set<number>();
+    for (const g of state.globs) {
+      seen.add(g.id);
+      let m = this.globMeshes.get(g.id);
+      if (!m) {
+        m = { ball: this.globBase.createInstance("gb" + g.id), ring: this.ringBase.createInstance("gr" + g.id), disc: this.discBase.createInstance("gd" + g.id) };
+        this.shadows.addShadowCaster(m.ball);
+        this.globMeshes.set(g.id, m);
+      }
+      const t = Math.min(1, g.t / g.dur);
+      const x = g.x0 + (g.tx - g.x0) * t, y = g.y0 + (g.ty - g.y0) * t;
+      m.ball.position.copyFrom(toWorld("dungeon", x, y, 1.0 + 4 * 3.2 * t * (1 - t)));
+      m.ball.rotation.set(this.time * 5, this.time * 3, 0);
+      const target = toWorld("dungeon", g.tx, g.ty, 0.04);
+      m.ring.position.copyFrom(target);
+      const rs = GLOB_SPLASH_R * (0.55 + 0.45 * t) * (1 + Math.sin(this.time * 18) * 0.03);
+      m.ring.scaling.set(rs / 1, 1, rs / 1);
+      m.disc.position.copyFrom(target.add(new Vector3(0, -0.01, 0)));
+      const ds = GLOB_SPLASH_R * t;
+      m.disc.scaling.set(ds, 1, ds);
+    }
+    for (const [id, m] of this.globMeshes)
+      if (!seen.has(id)) {
+        this.shadows.removeShadowCaster(m.ball);
+        m.ball.dispose();
+        m.ring.dispose();
+        m.disc.dispose();
+        this.globMeshes.delete(id);
+      }
+    const seenP = new Set<number>();
+    for (const q of state.puddles) {
+      seenP.add(q.id);
+      let m = this.puddleMeshes.get(q.id);
+      if (!m) {
+        m = this.puddleBase.createInstance("pd" + q.id);
+        this.puddleMeshes.set(q.id, m);
+      }
+      m.position.copyFrom(toWorld("dungeon", q.x, q.y, 0.03));
+      const k = q.r * Math.min(1, (q.max - q.life) * 8) * Math.min(1, q.life * 2.5);
+      m.scaling.set(k * (1 + Math.sin(this.time * 9 + q.id) * 0.05), 1, k);
+      if (Math.random() < 0.15) this.emit(q.x, q.y, "dungeon", 1, { c: hex("#7ad04a"), speed: 0.3, up: 1.2, g: 0.5, life: 0.5, size: 0.06, h: 0.05 });
+    }
+    for (const [id, m] of this.puddleMeshes)
+      if (!seenP.has(id)) {
+        m.dispose();
+        this.puddleMeshes.delete(id);
+      }
   }
 
   private syncCamera(state: GameState, dt: number) {
@@ -1076,6 +1189,21 @@ export class GameView {
       case "lunge":
         this.emit(e.x, e.y, e.map, 10, { c: hex("#b9b2c6"), speed: 1.5, up: 0.5, g: 0, life: 0.4, size: 0.18, grow: 1, h: 0.1 });
         this.shake = Math.max(this.shake, 0.25);
+        break;
+      case "clank":
+        this.emit(e.x, e.y, e.map, 12, { c: [W, hex("#c9d4e8"), hex("#8a96b0")], speed: 5, up: 3, g: 12, life: 0.25, size: 0.05, h: 0.8, dx: e.dx === undefined ? undefined : -e.dx, dy: e.dy === undefined ? undefined : -e.dy });
+        this.shake = Math.max(this.shake, 0.15);
+        break;
+      case "bossStun":
+        this.emit(e.x, e.y, e.map, 14, { c: [hex("#ffe066"), W], speed: 2, up: 3, g: 4, life: 0.7, size: 0.08, h: 1.6 });
+        this.shake = Math.max(this.shake, e.dx !== undefined ? 0.7 : 0.3);
+        break;
+      case "spit":
+        this.emit(e.x, e.y, e.map, e.dx ? 16 : 6, { c: [hex("#7ad04a"), hex("#5b2a7a")], speed: 2, up: 4, g: 8, life: 0.5, size: 0.1, h: 1.4 });
+        break;
+      case "splash":
+        this.emit(e.x, e.y, e.map, 22, { c: [hex("#7ad04a"), hex("#5b2a7a"), hex("#b06ad0")], speed: 3.5, up: 4, g: 12, life: 0.6, size: 0.1, h: 0.2 });
+        this.shake = Math.max(this.shake, 0.22);
         break;
       case "bossRoar":
         this.shake = Math.max(this.shake, 0.5);

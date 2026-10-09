@@ -29,7 +29,27 @@ export const CONTACT_COOLDOWN = 1.0;
 
 export const BOSS_R = 0.95;
 export const BOSS_HP = 8;
-export const BOSS_SPEED = 2.9;
+export const BOSS_SPEED = 3.6; // enraged (≤ half HP): ×1.15
+export const BOSS_CONTACT_DMG = 1; // half-heart for bumping into him
+export const BOSS_LUNGE_DMG = 2; // a full heart for eating a lunge
+export const BOSS_WINDUP = 0.65; // enraged 0.5 — amber glow + shudder tell
+export const BOSS_LUNGE_SPEED = 11;
+export const BOSS_LUNGE_TIME = 0.5;
+export const BOSS_LUNGE_RANGE = 7;
+export const BOSS_AIM_LOCK = 0.3; // last part of the windup: heading is locked, so a sidestep dodges
+export const BOSS_STUN_MAX_HITS = 2; // he shakes off the daze after two hits
+export const BOSS_STUN = 1.5; // dizzy window after every lunge
+export const BOSS_BONK_STUN = 1.9; // lunging into a wall dazes him longer
+export const BOSS_LUNGE_CD = 1.0; // after stun → chase before he may lunge again
+export const BOSS_GUARD = 2.5; // after a glancing (non-stun) hit: guarded + counter-lunge
+export const BOSS_COUNTER_WINDUP = 0.4;
+export const BOSS_SPIT_WINDUP = 0.6;
+export const BOSS_SPIT_CD = 4.5;
+export const GLOB_FLIGHT = 1.1;
+export const GLOB_SPLASH_R = 1.15;
+export const GLOB_DMG = 1;
+export const PUDDLE_R = 0.85;
+export const PUDDLE_LIFE = 1.6;
 
 /** Spawn sanctuary: enemies never enter and never aggro on a player inside it. */
 export const SAFE_RADIUS = 6.5;
