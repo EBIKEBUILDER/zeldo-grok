@@ -216,3 +216,28 @@ describe("quest", () => {
     expect(a.player.x).toBe(b.player.x);
   });
 });
+
+describe("breakables", () => {
+  it("pots are solid until broken, then break with debris event and vanish from collision", () => {
+    const s = fresh();
+    const pot = s.breakables.find((b) => b.kind === "pot" && b.map === "over")!;
+    s.player.x = pot.x - 1.5;
+    s.player.y = pot.y;
+    run(s, { right: true }, 60);
+    expect(s.player.x).toBeLessThan(pot.x - 0.5); // blocked by the pot
+    s.player.fx = 1; s.player.fy = 0;
+    stepGame(s, { ...idle(), attack: true });
+    expect(pot.alive).toBe(false);
+    expect(s.events.some((e) => e.type === "pot")).toBe(true);
+    run(s, { right: true }, 60);
+    expect(s.player.x).toBeGreaterThan(pot.x); // walks through the shards now
+  });
+  it("tufts are cut by the sword", () => {
+    const s = fresh();
+    const t = s.breakables.find((b) => b.kind === "tuft")!;
+    s.player.x = t.x - 0.8; s.player.y = t.y; s.player.fx = 1; s.player.fy = 0;
+    stepGame(s, { ...idle(), attack: true });
+    expect(t.alive).toBe(false);
+    expect(s.events.some((e) => e.type === "tuft")).toBe(true);
+  });
+});

@@ -352,14 +352,15 @@ export class GameView {
     return w;
   }
 
-  private thin(mesh: Mesh, mats: Matrix[], cast = true) {
+  /** `dynamic` must be true for instances we later hide/move (static buffers are never re-uploaded). */
+  private thin(mesh: Mesh, mats: Matrix[], cast = true, dynamic = false) {
     if (!mats.length) {
       mesh.setEnabled(false);
       return;
     }
     const buf = new Float32Array(mats.length * 16);
     mats.forEach((m, i) => m.copyToArray(buf, i * 16));
-    mesh.thinInstanceSetBuffer("matrix", buf, 16, true);
+    mesh.thinInstanceSetBuffer("matrix", buf, 16, !dynamic);
     mesh.receiveShadows = true;
     if (cast) this.shadows.addShadowCaster(mesh);
   }
@@ -676,8 +677,8 @@ export class GameView {
         pMats.push(m);
       }
     }
-    this.thin(tuft, tMats, false);
-    this.thin(pot, pMats, true);
+    this.thin(tuft, tMats, false, true);
+    this.thin(pot, pMats, true, true);
     tuft.thinInstanceRefreshBoundingInfo();
     this.pendingBreakables = null;
   }
