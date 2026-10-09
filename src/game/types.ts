@@ -171,6 +171,8 @@ export interface GameState {
   rng: number;
   nextId: number;
   eventSeq: number;
+  /** monotonic message counter (never resets while the page lives; carried across retries) */
+  msgSeq: number;
   player: Player;
   enemies: Enemy[];
   pickups: Pickup[];

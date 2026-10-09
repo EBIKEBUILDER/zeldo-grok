@@ -231,3 +231,18 @@ describe("breakables", () => {
     expect(s.events.some((e) => e.type === "tuft")).toBe(true);
   });
 });
+
+describe("messages", () => {
+  it("message ids are strictly increasing, even after a message expires", () => {
+    const s = fresh();
+    const ids: number[] = [s.message!.id];
+    run(s, {}, 60 * 6); // start message expires
+    expect(s.message).toBe(null);
+    s.player.x = 24; s.player.y = 4.2;
+    run(s, { up: true }, 40); // into the vault
+    s.player.x = 8; s.player.y = 13.2;
+    for (let i = 0; i < 30 && !s.message; i++) stepGame(s, { ...idle(), up: true });
+    ids.push(s.message!.id);
+    expect(ids[1]).toBeGreaterThan(ids[0]);
+  });
+});

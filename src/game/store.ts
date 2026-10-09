@@ -30,6 +30,7 @@ export const useGameStore = create<GameStore>((set, get) => ({
   },
   retry: () => {
     const g = createInitialState((Date.now() & 0xffff) + 1);
+    g.msgSeq = get().game.msgSeq; // keep message ids unique across retries
     startGame(g);
     set({ game: g, frame: get().frame + 1 });
   },

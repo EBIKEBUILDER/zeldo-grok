@@ -1,12 +1,13 @@
 "use client";
-import { useEffect, useState } from "react";
+import { useEffect, useId, useState } from "react";
 import { useGameStore } from "@/game/store";
 
 function Heart({ fill }: { fill: 0 | 1 | 2 }) {
+  const clip = `heart-clip-${useId().replace(/:/g, "")}`;
   return (
     <svg viewBox="0 0 24 22" className="h-7 w-7 drop-shadow-[0_2px_0_rgba(0,0,0,0.35)]">
       <defs>
-        <clipPath id={`half-${fill}`}>
+        <clipPath id={clip}>
           <rect x="0" y="0" width={fill === 2 ? 24 : fill === 1 ? 12 : 0} height="22" />
         </clipPath>
       </defs>
@@ -14,9 +15,9 @@ function Heart({ fill }: { fill: 0 | 1 | 2 }) {
       <path
         d="M12 21 L2.5 11.5 C-0.5 8.5 1 2 6.5 2 C9 2 11 3.6 12 5.5 C13 3.6 15 2 17.5 2 C23 2 24.5 8.5 21.5 11.5 Z"
         fill="#ff4d5e"
-        clipPath={`url(#half-${fill})`}
+        clipPath={`url(#${clip})`}
       />
-      {fill > 0 && <ellipse cx="7" cy="7" rx="2.2" ry="1.4" fill="#ffd0d5" opacity="0.8" clipPath={`url(#half-${fill})`} />}
+      {fill > 0 && <ellipse cx="7" cy="7" rx="2.2" ry="1.4" fill="#ffd0d5" opacity="0.8" clipPath={`url(#${clip})`} />}
     </svg>
   );
 }
@@ -71,7 +72,7 @@ export default function Hud({ onStart }: { onStart: () => void }) {
       {/* damage flash: red vignette */}
       {hurtCount > 0 && (
         <div
-          key={hurtCount}
+          key={`hurt-${hurtCount}`}
           className="hurt-flash absolute inset-0"
           style={{ boxShadow: "inset 0 0 140px 50px rgba(255,30,50,0.75)", background: "radial-gradient(ellipse at center, transparent 55%, rgba(255,20,40,0.35) 100%)" }}
         />
@@ -84,7 +85,7 @@ export default function Hud({ onStart }: { onStart: () => void }) {
           <div className="absolute left-4 top-4 flex flex-col gap-2">
             <div className="flex gap-1" data-testid="hearts">
               {hearts.map((f, i) => (
-                <Heart key={i} fill={f} />
+                <Heart key={`heart-${i}`} fill={f} />
               ))}
             </div>
             <div className="flex items-center gap-2 rounded-full bg-black/35 px-3 py-1 text-lg font-bold" data-testid="rupees">
@@ -101,7 +102,7 @@ export default function Hud({ onStart }: { onStart: () => void }) {
               {fmtTime(time)} · {muted ? "🔇 muted (M)" : "🔊 M to mute"}
             </div>
           </div>
-          <div key={area} className="area-banner absolute left-1/2 top-16 -translate-x-1/2 text-center">
+          <div key={`area-${area}`} className="area-banner absolute left-1/2 top-16 -translate-x-1/2 text-center">
             <div className="text-2xl font-black tracking-widest text-amber-50 drop-shadow-[0_3px_0_rgba(0,0,0,0.5)]">{area}</div>
           </div>
         </>
@@ -117,7 +118,7 @@ export default function Hud({ onStart }: { onStart: () => void }) {
       )}
 
       {msgText && phase === "playing" && (
-        <div key={msgId} className="pop-in absolute bottom-8 left-1/2 max-w-[80vw] -translate-x-1/2 rounded-xl border-2 border-amber-200/60 bg-[#1b1424]/85 px-6 py-3 text-center text-lg font-semibold shadow-xl">
+        <div key={`msg-${msgId}`} className="pop-in absolute bottom-8 left-1/2 max-w-[80vw] -translate-x-1/2 rounded-xl border-2 border-amber-200/60 bg-[#1b1424]/85 px-6 py-3 text-center text-lg font-semibold shadow-xl">
           {msgText}
         </div>
       )}

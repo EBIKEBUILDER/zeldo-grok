@@ -91,6 +91,7 @@ export function createInitialState(seed = 12345): GameState {
     rng: seed | 0,
     nextId: id,
     eventSeq: 0,
+    msgSeq: 0,
     player,
     enemies,
     pickups: [],
@@ -115,7 +116,7 @@ function emit(s: GameState, type: EventType, map: MapId, x: number, y: number, d
 }
 
 function say(s: GameState, text: string, t = 2.6) {
-  s.message = { id: (s.message?.id ?? 0) + 1, text, t };
+  s.message = { id: ++s.msgSeq, text, t };
 }
 
 export function gateClosed(s: GameState): boolean {
