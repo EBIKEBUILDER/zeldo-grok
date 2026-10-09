@@ -2,9 +2,24 @@
  * Pure game simulation. Operates on plain serializable data (GameState) with a fixed timestep.
  * No Babylon, no React, no DOM — so it runs identically in tests, at any frame rate.
  */
+import type { Portal } from "./world";
 import * as C from "./constants";
 import { mulberry } from "./rng";
-import { FIELD_MIN_TICKS, astar, buildField, canStep, descend, fieldAt, type Blocked, type FlowField } from "./path";
+import {
+  ASTAR_MAX_NODES,
+  FIELD_MIN_TICKS,
+  NAV_MAX_REQUESTS_PER_TICK,
+  NAV_TICK_NODES,
+  astarEx,
+  buildFieldSeeds,
+  canStep,
+  descend,
+  fieldAt,
+  type Blocked,
+  type FlowField,
+  type Seed,
+} from "./path";
+import { chargeNav, navGrid, navStats } from "./nav";
 import type { Breakable, Enemy, EventType, GameState, Glob, InputState, Pickup, Player, Puddle } from "./types";
 import {
   BREAKABLES,
@@ -20,6 +35,7 @@ import {
   OVER_DOOR_EXIT,
   OVER_ENEMIES,
   PEDESTAL,
+  PORTALS,
   SPAWN,
   Tile,
   areaName,
@@ -42,6 +58,7 @@ export function createInitialState(seed = 12345): GameState {
       y: s.y,
       vx: 0,
       vy: 0,
+      homeMap: s.map,
       homeX: s.x,
       homeY: s.y,
       r: boss ? C.BOSS_R : C.BLOB_R,
@@ -67,6 +84,11 @@ export function createInitialState(seed = 12345): GameState {
       sampleX: s.x,
       sampleY: s.y,
       aggroCd: 0,
+      navReq: 0,
+      navReqTick: 0,
+      fbTx: -1,
+      fbTy: -1,
+      fbTick: -1e9,
       path: [],
       pathI: 0,
     };
@@ -512,12 +534,9 @@ function dungeonTriggers(s: GameState) {
 
 
 // ───────────────────────────── navigation ─────────────────────────────
-/** Pots block the flow field (they're solid); everything else comes from the tile map. */
+/** Live nav grid (tiles + gate + pots), patched incrementally — see nav.ts. */
 function navBlocked(s: GameState, map: MapId): Blocked {
-  const pots = new Set<number>();
-  const w = MAPS[map].w;
-  for (const b of s.breakables) if (b.alive && b.kind === "pot" && b.map === map) pots.add(Math.floor(b.y) * w + Math.floor(b.x));
-  return (tx, ty) => solidAt(s, map, tx, ty) || pots.has(ty * w + tx);
+  return navGrid(s, map, gateClosed(s)).blocked;
 }
 
 interface FieldCache {
@@ -528,30 +547,75 @@ interface FieldCache {
 }
 const fieldCache = new WeakMap<GameState, Partial<Record<MapId, FieldCache>>>();
 
-/** Shared flow field toward the player for `map`; rebuilt on player tile/world change, rate-capped. */
+/** Portals on `map` that an AI may take toward `toMap`. */
+function aiPortals(map: MapId, toMap: MapId) {
+  return PORTALS.filter((q) => q.fromMap === map && q.toMap === toMap && q.traversableByAI);
+}
+
+/**
+ * Shared flow field toward the player for `map`; rebuilt on player tile / nav-grid change,
+ * rate-capped to one rebuild per FIELD_MIN_TICKS. On a map the player is not on, it is seeded at the
+ * AI-traversable portal mouths leading to the player's map (cost = portal cost + the player-side
+ * field value at the portal's exit), so A* and descent just treat portals as edges.
+ */
 export function playerField(s: GameState, map: MapId): FieldCache {
   let c = fieldCache.get(s);
   if (!c) fieldCache.set(s, (c = {}));
   const p = s.player;
   const ptx = Math.floor(p.x), pty = Math.floor(p.y);
-  const key = `${p.map === map ? `${ptx},${pty}` : "none"}|${gateClosed(s) ? 1 : 0}|${s.worldVersion}`;
+  const grid = navGrid(s, map, gateClosed(s));
+  let seeds: Seed[] = [];
+  let target: string;
+  if (p.map === map) {
+    seeds = [{ x: ptx, y: pty, c: 0 }];
+    target = `${ptx},${pty}`;
+  } else {
+    const far = aiPortals(map, p.map);
+    if (far.length) {
+      const pf = playerField(s, p.map);
+      for (const q of far) {
+        const v = fieldAt(pf.field, q.toTile.x, q.toTile.y);
+        if (v < Infinity) seeds.push({ x: q.fromTile.x, y: q.fromTile.y, c: q.cost + v });
+      }
+      target = `via:${pf.key}:${far.map((q) => q.id).join(",")}`;
+    } else target = "none";
+  }
+  const key = `${target}|${grid.version}`;
   const cur = c[map];
   if (cur && (cur.key === key || s.tick - cur.tick < FIELD_MIN_TICKS)) return cur;
   const m = MAPS[map];
-  const blocked = navBlocked(s, map);
-  const field = p.map === map ? buildField(m.w, m.h, blocked, ptx, pty) : buildField(m.w, m.h, blocked, -1, -1);
-  return (c[map] = { key, tick: s.tick, field, blocked });
+  const field = buildFieldSeeds(m.w, m.h, grid.blocked, seeds, p.map === map ? ptx : -1, p.map === map ? pty : -1);
+  chargeNav(s, field.nodes, false);
+  navStats(s).fieldBuilds++;
+  return (c[map] = { key, tick: s.tick, field, blocked: grid.blocked });
 }
 
-/** Is a straight walk from a→b clear for a body of half-size r (samples every ¼ tile)? */
-function clearWalk(s: GameState, map: MapId, ax: number, ay: number, bx: number, by: number, r: number): boolean {
+/**
+ * Is a straight walk from a→b clear for a body of half-size r (samples every ¼ tile)? With
+ * `circles`, round props (pots) also block — they are physics circles, not solid tiles, so without
+ * this a chaser would take the shortcut straight into a pot and stay pinned against it.
+ */
+function clearWalk(s: GameState, map: MapId, ax: number, ay: number, bx: number, by: number, r: number, circles?: Circle[]): boolean {
   const d = len(bx - ax, by - ay);
   const n = Math.max(1, Math.ceil(d / 0.25));
   for (let i = 1; i <= n; i++) {
     const t = i / n;
     if (boxHitsSolid(s, map, ax + (bx - ax) * t, ay + (by - ay) * t, r)) return false;
   }
+  if (circles)
+    for (const c of circles) {
+      // closest point on the segment to the circle centre
+      const sx = bx - ax, sy = by - ay;
+      const l2 = sx * sx + sy * sy;
+      const u = l2 > 0 ? Math.max(0, Math.min(1, ((c.x - ax) * sx + (c.y - ay) * sy) / l2)) : 0;
+      if (len(ax + sx * u - c.x, ay + sy * u - c.y) < r + c.r) return false;
+    }
   return true;
+}
+
+/** Contact-damage range for an enemy (slightly beyond the body separation distance). */
+export function contactRange(e: Enemy): number {
+  return C.PLAYER_R + e.r + (e.kind === "boss" ? C.BOSS_CONTACT_REACH : C.BLOB_CONTACT_REACH);
 }
 
 const steerOut = { x: 0, y: 0 };
@@ -563,7 +627,8 @@ const steerOut = { x: 0, y: 0 };
 export function steerToPlayer(s: GameState, e: Enemy): { x: number; y: number } | null {
   const p = s.player;
   const r = e.r * 0.85;
-  if (len(p.x - e.x, p.y - e.y) < 7 && clearWalk(s, e.map, e.x, e.y, p.x, p.y, r * 0.9)) {
+  const circles = staticCircles(s, e.map);
+  if (len(p.x - e.x, p.y - e.y) < 7 && clearWalk(s, e.map, e.x, e.y, p.x, p.y, r * 0.9, circles)) {
     steerOut.x = p.x;
     steerOut.y = p.y;
     return steerOut;
@@ -589,7 +654,7 @@ export function steerToPlayer(s: GameState, e: Enemy): { x: number; y: number } 
     const nxt = descend(fc.field, fc.blocked, tx, ty);
     if (!nxt) break;
     [tx, ty] = nxt;
-    if (first || clearWalk(s, e.map, e.x, e.y, tx + 0.5, ty + 0.5, r * 0.9)) {
+    if (first || clearWalk(s, e.map, e.x, e.y, tx + 0.5, ty + 0.5, r * 0.9, circles)) {
       bx = tx + 0.5;
       by = ty + 0.5;
     } else break;
@@ -611,14 +676,133 @@ export function steerToPlayer(s: GameState, e: Enemy): { x: number; y: number } 
   return steerOut;
 }
 
+/** Queue a path request; the nav queue serves it within the per-tick budget (see serveNavQueue). */
+function requestPath(s: GameState, e: Enemy, kind: 1 | 2) {
+  e.navReq = kind;
+  e.navReqTick = s.tick;
+  e.path = [];
+  e.pathI = 0;
+}
+
 function startReturn(s: GameState, e: Enemy) {
   e.state = "return";
   e.aggroCd = C.BLOB_REAGGRO_CD;
   e.stuckT = 0;
-  const m = MAPS[e.map];
-  const path = astar(m.w, m.h, navBlocked(s, e.map), Math.floor(e.x), Math.floor(e.y), Math.floor(e.homeX), Math.floor(e.homeY));
-  e.path = path ?? [];
+  e.sampleT = 0;
+  e.sampleX = e.x;
+  e.sampleY = e.y;
+  requestPath(s, e, 1);
+}
+
+function nearestPortal(e: Enemy, toMap: MapId, aiOnly: boolean): Portal | null {
+  let best: Portal | null = null, bd = Infinity;
+  for (const q of PORTALS) {
+    if (q.fromMap !== e.map || q.toMap !== toMap || (aiOnly && !q.traversableByAI)) continue;
+    const d = len(q.fromTile.x + 0.5 - e.x, q.fromTile.y + 0.5 - e.y);
+    if (d < bd) (bd = d), (best = q);
+  }
+  return best;
+}
+
+/** Distance home, measured through the portal back if the enemy followed the hero to another map. */
+function homeDistance(e: Enemy): number {
+  if (e.map === e.homeMap) return len(e.x - e.homeX, e.y - e.homeY);
+  const q = nearestPortal(e, e.homeMap, false);
+  if (!q) return Infinity;
+  return len(q.fromTile.x + 0.5 - e.x, q.fromTile.y + 0.5 - e.y) + q.cost + len(q.toTile.x + 0.5 - e.homeX, q.toTile.y + 0.5 - e.homeY);
+}
+
+/** Where a returning enemy heads on its current map: home, or the mouth of the portal back. */
+function returnTarget(e: Enemy): { x: number; y: number; portal: Portal | null } {
+  if (e.map === e.homeMap) return { x: e.homeX, y: e.homeY, portal: null };
+  const q = nearestPortal(e, e.homeMap, false);
+  return q ? { x: q.fromTile.x + 0.5, y: q.fromTile.y + 0.5, portal: q } : { x: e.x, y: e.y, portal: null };
+}
+
+/** No-path fallback target: the hero (same map) or the entrance they left through (other map). */
+function fallbackTarget(s: GameState, e: Enemy): { x: number; y: number } | null {
+  const p = s.player;
+  if (p.map === e.map) return { x: p.x, y: p.y };
+  const q = nearestPortal(e, p.map, false);
+  return q ? { x: q.fromTile.x + 0.5, y: q.fromTile.y + 0.5 } : null;
+}
+
+function usePortal(e: Enemy, q: Portal) {
+  e.map = q.toMap;
+  e.x = q.toTile.x + 0.5;
+  e.y = q.toTile.y + 0.5;
+  e.vx = e.vy = 0;
+  e.sampleX = e.x;
+  e.sampleY = e.y;
+  e.path = [];
   e.pathI = 0;
+  e.fbTx = e.fbTy = -1;
+}
+
+/**
+ * Serve queued A* requests (walk-home and no-path fallback), oldest first then by id, while the
+ * tick's budget allows: at most NAV_MAX_REQUESTS_PER_TICK runs, and a run only starts if a worst-case
+ * search (ASTAR_MAX_NODES) still fits under NAV_TICK_NODES after this tick's field rebuilds. Twelve
+ * monsters giving up on the same tick are therefore spread over a few ticks instead of one spike.
+ */
+export function serveNavQueue(s: GameState) {
+  const st = navStats(s);
+  const queue = s.enemies.filter((e) => e.alive && e.navReq !== 0).sort((a, b) => a.navReqTick - b.navReqTick || a.id - b.id);
+  for (const e of queue) {
+    if (st.requests >= NAV_MAX_REQUESTS_PER_TICK || st.nodes + ASTAR_MAX_NODES > NAV_TICK_NODES) break;
+    const kind = e.navReq;
+    e.navReq = 0;
+    const tgt = kind === 1 ? returnTarget(e) : fallbackTarget(s, e);
+    if (!tgt) continue;
+    const m = MAPS[e.map];
+    const r = astarEx(m.w, m.h, navBlocked(s, e.map), Math.floor(e.x), Math.floor(e.y), Math.floor(tgt.x), Math.floor(tgt.y), true);
+    chargeNav(s, r.nodes, true);
+    e.path = r.path ?? [];
+    e.pathI = 0;
+    if (kind === 2) {
+      e.fbTx = Math.floor(tgt.x);
+      e.fbTy = Math.floor(tgt.y);
+      e.fbTick = s.tick;
+    }
+  }
+}
+
+const followOut = { x: 0, y: 0 };
+/** Follow e.path with look-ahead smoothing; null once the path is used up. */
+function followPath(s: GameState, e: Enemy, speed: number): { x: number; y: number } | null {
+  if (e.pathI >= e.path.length) return null;
+  const w = MAPS[e.map].w;
+  let target = e.pathI;
+  for (let k = e.pathI + 1; k < Math.min(e.path.length, e.pathI + 5); k++) {
+    const c = e.path[k];
+    if (clearWalk(s, e.map, e.x, e.y, (c % w) + 0.5, Math.floor(c / w) + 0.5, e.r * 0.8)) target = k;
+  }
+  e.pathI = target;
+  const c = e.path[e.pathI];
+  const wx = (c % w) + 0.5 - e.x, wy = Math.floor(c / w) + 0.5 - e.y;
+  const wl = len(wx, wy);
+  followOut.x = followOut.y = 0;
+  if (wl < 0.35) e.pathI++;
+  else {
+    followOut.x = (wx / wl) * speed;
+    followOut.y = (wy / wl) * speed;
+  }
+  return followOut;
+}
+
+/**
+ * "Brawling" = actually trading blows: within hit range of a player who is not in the sanctuary,
+ * or wedged against a packmate that is. Only this (or real movement) resets the give-up timer, so a
+ * chaser pinned out of reach (behind a pot, at the sanctuary edge) gives up instead of loitering.
+ */
+function brawling(s: GameState, e: Enemy, playerSafe: boolean): boolean {
+  const p = s.player;
+  if (playerSafe || p.map !== e.map) return false;
+  const near = (q: Enemy) => len(p.x - q.x, p.y - q.y) < contactRange(q) + 0.1;
+  if (near(e)) return true;
+  for (const q of s.enemies)
+    if (q !== e && q.alive && q.map === e.map && len(q.x - e.x, q.y - e.y) < q.r + e.r + 0.15 && near(q)) return true;
+  return false;
 }
 
 function blobBrain(s: GameState, e: Enemy, dt: number, d: number, samePlace: boolean) {
@@ -626,56 +810,105 @@ function blobBrain(s: GameState, e: Enemy, dt: number, d: number, samePlace: boo
   e.aggroCd = Math.max(0, e.aggroCd - dt);
   const playerSafe = inSanctuary(p.map, p.x, p.y);
   let tx = 0, ty = 0;
-  const homeD = len(e.x - e.homeX, e.y - e.homeY);
+  const homeD = homeDistance(e);
 
   if (e.state === "chase") {
-    if (!samePlace || s.phase !== "playing" || d > C.BLOB_DEAGGRO || homeD > C.BLOB_LEASH) startReturn(s, e);
+    // how far away is the hero along the way we'd go? other map: path cost through a portal, or (no
+    // AI-usable portal) distance to the entrance they left by — we walk up to it and give up there
+    let reachD = d;
+    if (!samePlace) {
+      const v = fieldAt(playerField(s, e.map).field, Math.floor(e.x), Math.floor(e.y));
+      const fb = fallbackTarget(s, e);
+      reachD = v < Infinity ? v : fb ? len(fb.x - e.x, fb.y - e.y) : Infinity;
+    }
+    // the hero ducking into the sanctuary makes chasers break off at once (no loitering at its edge)
+    if (s.phase !== "playing" || playerSafe || reachD > C.BLOB_DEAGGRO || homeD > C.BLOB_LEASH) startReturn(s, e);
     else {
       // progress check once a second: moved meaningfully, or already brawling
       e.sampleT += dt;
       if (e.sampleT >= 1) {
         const moved = len(e.x - e.sampleX, e.y - e.sampleY);
-        const brawling = d < e.r + C.PLAYER_R + 0.6;
-        if (moved > 0.5 || brawling) e.stuckT = 0;
+        if (moved > 0.5 || brawling(s, e, playerSafe)) e.stuckT = 0;
         else e.stuckT += e.sampleT;
         e.sampleT = 0;
         e.sampleX = e.x;
         e.sampleY = e.y;
       }
-      const goal = steerToPlayer(s, e);
+      const goal = e.stuckT >= C.BLOB_GIVEUP ? null : steerToPlayer(s, e);
       if (e.stuckT >= C.BLOB_GIVEUP) startReturn(s, e);
       else if (goal) {
+        if (e.navReq === 2) e.navReq = 0;
+        e.path.length = 0;
+        e.pathI = 0;
+        e.fbTx = e.fbTy = -1;
         const gx = goal.x - e.x, gy = goal.y - e.y;
         const gl = len(gx, gy) || 1;
-        tx = (gx / gl) * C.BLOB_SPEED;
-        ty = (gy / gl) * C.BLOB_SPEED;
+        let ux = gx / gl, uy = gy / gl;
+        if (samePlace && d < 2.5) {
+          // crowding: lean away from packmates we are bumping so we slide around them into a free
+          // spot on the hero's ring instead of queueing behind them out of reach
+          for (const q of s.enemies) {
+            if (q === e || !q.alive || q.map !== e.map) continue;
+            const ox = e.x - q.x, oy = e.y - q.y;
+            const od = len(ox, oy);
+            const reach = e.r + q.r + 0.25;
+            if (od > 1e-5 && od < reach) {
+              const w = 1.2 * (1 - od / reach) + 0.35;
+              ux += (ox / od) * w;
+              uy += (oy / od) * w;
+            }
+          }
+          const ul = len(ux, uy) || 1;
+          ux /= ul;
+          uy /= ul;
+        }
+        tx = ux * C.BLOB_SPEED;
+        ty = uy * C.BLOB_SPEED;
+      } else {
+        // NO PATH: walk to the reachable tile closest to the target (A* closest-node fallback), then
+        // hold still — no grinding on walls. The give-up timer above then sends us home.
+        const tgt = fallbackTarget(s, e);
+        if (tgt && e.navReq === 0) {
+          const ftx = Math.floor(tgt.x), fty = Math.floor(tgt.y);
+          const shifted = e.fbTx < 0 || Math.max(Math.abs(ftx - e.fbTx), Math.abs(fty - e.fbTy)) >= 3;
+          if (shifted && s.tick - e.fbTick >= C.NAV_FALLBACK_REPATH_TICKS) requestPath(s, e, 2);
+        }
+        const v = followPath(s, e, C.BLOB_SPEED * 0.8);
+        if (v) {
+          tx = v.x;
+          ty = v.y;
+        }
       }
     }
   }
   if (e.state === "return") {
-    if (e.pathI < e.path.length) {
-      const w = MAPS[e.map].w;
-      // smoothing: skip ahead to the furthest waypoint we can walk to directly
-      let target = e.pathI;
-      for (let k = e.pathI + 1; k < Math.min(e.path.length, e.pathI + 5); k++) {
-        const c = e.path[k];
-        if (clearWalk(s, e.map, e.x, e.y, (c % w) + 0.5, Math.floor(c / w) + 0.5, e.r * 0.8)) target = k;
-      }
-      e.pathI = target;
-      const c = e.path[e.pathI];
-      const wx = (c % w) + 0.5 - e.x, wy = Math.floor(c / w) + 0.5 - e.y;
-      const wl = len(wx, wy);
-      if (wl < 0.35) e.pathI++;
-      else {
-        tx = (wx / wl) * 1.6;
-        ty = (wy / wl) * 1.6;
-      }
+    // a return that makes no headway (home unreachable, shoved into a corner) settles instead of grinding
+    e.sampleT += dt;
+    if (e.sampleT >= 1) {
+      if (len(e.x - e.sampleX, e.y - e.sampleY) > 0.3) e.stuckT = 0;
+      else e.stuckT += e.sampleT;
+      e.sampleT = 0;
+      e.sampleX = e.x;
+      e.sampleY = e.y;
+    }
+    const tgt = returnTarget(e);
+    const v = e.navReq === 1 ? null : followPath(s, e, 1.6);
+    if (e.navReq === 1) {
+      // waiting for the nav queue (a tick or two): ease to a stop
+    } else if (v) {
+      tx = v.x;
+      ty = v.y;
     } else {
-      const hx = e.homeX - e.x, hy = e.homeY - e.y;
+      const hx = tgt.x - e.x, hy = tgt.y - e.y;
       const hl = len(hx, hy);
-      if (hl < 0.4) {
+      if (tgt.portal && hl < 0.6) {
+        usePortal(e, tgt.portal);
+        requestPath(s, e, 1);
+      } else if ((!tgt.portal && hl < 0.4) || e.stuckT >= 3 || (hl > 1.5 && !clearWalk(s, e.map, e.x, e.y, tgt.x, tgt.y, e.r * 0.8))) {
+        // home reached — or the path ran out short of it (closest-reachable fallback): settle here
         e.state = "idle";
         e.stateT = 1;
+        e.stuckT = 0;
       } else {
         tx = (hx / hl) * 1.6;
         ty = (hy / hl) * 1.6;
@@ -686,6 +919,10 @@ function blobBrain(s: GameState, e: Enemy, dt: number, d: number, samePlace: boo
     const sees = samePlace && d < C.BLOB_AGGRO && (d < 2.5 || clearWalk(s, e.map, e.x, e.y, p.x, p.y, 0.05));
     if (s.phase === "playing" && !playerSafe && e.aggroCd <= 0 && sees) {
       e.state = "chase";
+      e.navReq = 0;
+      e.path.length = 0;
+      e.pathI = 0;
+      e.fbTx = e.fbTy = -1;
       e.stuckT = 0;
       e.sampleT = 0;
       e.sampleX = e.x;
@@ -693,7 +930,11 @@ function blobBrain(s: GameState, e: Enemy, dt: number, d: number, samePlace: boo
     } else {
       e.stateT -= dt;
       if (e.stateT <= 0) {
-        if (homeD > 3.5) {
+        if (homeD > 3.5 && e.aggroCd <= 0) {
+          // drifted far (shoved, or settled short of home): walk back on a real path
+          startReturn(s, e);
+          e.aggroCd = 0;
+        } else if (homeD > 3.5) {
           e.state = "wander";
           e.wx = (e.homeX - e.x) / homeD;
           e.wy = (e.homeY - e.y) / homeD;
@@ -725,9 +966,13 @@ function updateEnemies(s: GameState, dt: number) {
     if (!e.alive) {
       if (e.kind === "blob") {
         e.respawnT -= dt;
-        const far = p.map !== e.map || len(p.x - e.homeX, p.y - e.homeY) > 6;
+        const far = p.map !== e.homeMap || len(p.x - e.homeX, p.y - e.homeY) > 6;
         if (e.respawnT <= 0 && far) {
           e.alive = true;
+          e.map = e.homeMap;
+          e.navReq = 0;
+          e.path = [];
+          e.pathI = 0;
           e.hp = e.maxHp;
           e.x = e.homeX;
           e.y = e.homeY;
@@ -740,7 +985,8 @@ function updateEnemies(s: GameState, dt: number) {
       continue;
     }
     e.hitFlash = Math.max(0, e.hitFlash - dt);
-    e.contactCd = Math.max(0, e.contactCd - dt);
+    // goes below zero while ready: -contactCd = how long it has been waiting for an opening
+    e.contactCd = Math.max(-10, e.contactCd - dt);
     const samePlace = e.map === p.map;
     const dx = p.x - e.x, dy = p.y - e.y;
     const d = len(dx, dy);
@@ -775,6 +1021,15 @@ function updateEnemies(s: GameState, dt: number) {
       if (e.state === "wander") e.stateT = 0;
     }
     pushOutOfCircles(s, e, e.r * 0.85, staticCircles(s, e.map));
+    // a chaser standing in an AI-traversable portal mouth that leads to the hero follows them through
+    if (e.kind === "blob" && e.state === "chase" && e.map !== p.map) {
+      const etx = Math.floor(e.x), ety = Math.floor(e.y);
+      for (const q of PORTALS)
+        if (q.traversableByAI && q.fromMap === e.map && q.toMap === p.map && q.fromTile.x === etx && q.fromTile.y === ety) {
+          usePortal(e, q);
+          break;
+        }
+    }
     // Sanctuary: enemies can never enter the spawn circle.
     if (e.map === "over") {
       const sx = e.x - SPAWN.x, sy = e.y - SPAWN.y;
@@ -783,6 +1038,7 @@ function updateEnemies(s: GameState, dt: number) {
       if (sd < min) moveBody(s, e, (sx / (sd || 1)) * (min - sd), (sy / (sd || 1)) * (min - sd), e.r * 0.85);
     }
   }
+  serveNavQueue(s);
 }
 
 function hasLineOfSight(s: GameState, map: MapId, x0: number, y0: number, x1: number, y1: number): boolean {
@@ -977,16 +1233,22 @@ function resolveBodies(s: GameState) {
       }
     }
   }
-  // contact damage
+  // contact damage: of everything touching the hero and off cooldown, the one that has been waiting
+  // longest lands the hit (so in a crowd every adjacent blob gets its turn, deterministically)
+  if (p.invuln > 0 || inSanctuary(p.map, p.x, p.y)) return;
+  let hitter: Enemy | null = null;
   for (const e of live) {
     if (e.kind === "boss" && !s.flags.bossAwake) continue;
-    const d = len(p.x - e.x, p.y - e.y);
     if (e.state === "stunned") continue; // dazed boss is harmless to touch
-    if (d < C.PLAYER_R + e.r + 0.08 && e.contactCd <= 0 && e.stun <= 0 && p.invuln <= 0) {
-      e.contactCd = C.CONTACT_COOLDOWN;
-      const dmg = e.kind !== "boss" ? 1 : e.state === "lunge" ? C.BOSS_LUNGE_DMG : C.BOSS_CONTACT_DMG;
-      hurtPlayer(s, dmg, e.x, e.y);
-    }
+    if (e.contactCd > 0 || e.stun > 0) continue;
+    if (len(p.x - e.x, p.y - e.y) >= contactRange(e)) continue;
+    if (!hitter || e.contactCd < hitter.contactCd) hitter = e;
+  }
+  if (hitter) {
+    const e = hitter;
+    e.contactCd = C.CONTACT_COOLDOWN;
+    const dmg = e.kind !== "boss" ? 1 : e.state === "lunge" ? C.BOSS_LUNGE_DMG : C.BOSS_CONTACT_DMG;
+    hurtPlayer(s, dmg, e.x, e.y);
   }
 }
 

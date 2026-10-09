@@ -48,6 +48,8 @@ export interface Enemy {
   y: number;
   vx: number;
   vy: number;
+  /** the map the enemy spawns on / walks back to (it may follow the hero through a portal) */
+  homeMap: MapId;
   homeX: number;
   homeY: number;
   r: number;
@@ -80,7 +82,14 @@ export interface Enemy {
   sampleY: number;
   /** after giving up, ignore the player for a moment */
   aggroCd: number;
-  /** walking home: tile indices on the current map, and the next index to visit */
+  /** queued nav request: 0 none, 1 path home, 2 no-path fallback (closest reachable tile) */
+  navReq: 0 | 1 | 2;
+  navReqTick: number;
+  /** fallback bookkeeping: target tile of the last fallback path and when it was planned */
+  fbTx: number;
+  fbTy: number;
+  fbTick: number;
+  /** walking home / fallback: tile indices on the current map, and the next index to visit */
   path: number[];
   pathI: number;
 }

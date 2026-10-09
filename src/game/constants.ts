@@ -30,6 +30,13 @@ export const BLOB_GIVEUP = 5.5; // seconds of no progress / no path before walki
 export const BLOB_REAGGRO_CD = 3;
 export const BLOB_RESPAWN = 20;
 export const CONTACT_COOLDOWN = 1.0;
+/**
+ * Bodies are pushed apart to exactly PLAYER_R + e.r; contact damage reaches a little further than
+ * that so anything that is visibly touching the hero (or pressing on them) can actually land a hit.
+ * Blob: 0.72 separation → 0.90 hit range. The Warden keeps his tuned 0.08 margin.
+ */
+export const BLOB_CONTACT_REACH = 0.18;
+export const BOSS_CONTACT_REACH = 0.08;
 
 export const BOSS_R = 0.95;
 export const BOSS_HP = 8;
@@ -65,8 +72,15 @@ export const GLOB_DMG = 1;
 export const PUDDLE_R = 0.85;
 export const PUDDLE_LIFE = 1.6;
 
-/** Spawn sanctuary: enemies never enter and never aggro on a player inside it. */
-export const SAFE_RADIUS = 6.5;
+/**
+ * Spawn sanctuary (the Hearthollow plaza): enemies never enter it, never aggro on or touch a player
+ * inside it, and chasers break off the moment the player steps in. 4.5 keeps it to the plaza so
+ * chasers can follow through the hedge gaps into Hearthollow (6.5 reached the screen edges and
+ * read as an invisible wall at the boundary).
+ */
+export const SAFE_RADIUS = 4.5;
+/** No-path fallback: replan at most this often, and only if the target moved ≥ 3 tiles. */
+export const NAV_FALLBACK_REPATH_TICKS = 30;
 
 export const PICKUP_LIFE = 18;
 export const MAGNET_RADIUS = 1.9;
