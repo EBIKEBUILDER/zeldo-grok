@@ -4,10 +4,15 @@
  * cosmetic effects (sparks, debris, poofs, shake). No game rules live here.
  */
 import {
+  Camera,
   Color3,
   Color4,
+  ColorCurves,
   DirectionalLight,
   Engine,
+  EngineInstrumentation,
+  ImageProcessingConfiguration,
+  SceneInstrumentation,
   FreeCamera,
   GlowLayer,
   HemisphericLight,
@@ -20,6 +25,7 @@ import {
   ShadowGenerator,
   StandardMaterial,
   TransformNode,
+  Texture,
   Vector3,
   VertexBuffer,
   VertexData,
@@ -30,6 +36,7 @@ import { hash2, makeRng } from "../rng";
 import { chestVisible, gateClosed } from "../sim";
 import type { GameEvent, GameState } from "../types";
 import { CHEST, DUNGEON, GATE_ROW, MAPS, OVERWORLD, PEDESTAL, SPAWN, Tile, type MapData, type MapId } from "../world";
+import { SwayPlugin, bakeHeightAO, makeShimmerTexture, swayClock } from "./fx";
 import {
   hex,
   makeBlob,
@@ -75,6 +82,52 @@ const ZERO = Matrix.Compose(new Vector3(0, 0, 0), Quaternion.Identity(), new Vec
 
 function screenOf(x: number, y: number) {
   return { sx: Math.min(2, Math.max(0, Math.floor(x / 16))), sy: Math.min(1, Math.max(0, Math.floor(y / 12))) };
+}
+
+/**
+ * Static scenery is split into chunks so frustum culling can drop what's off screen:
+ * overworld screens 0-5 (sy*3+sx) and the vault's antechamber (6) / hall (7) — the same ids as
+ * `state.explored`. Takes Babylon world x/z.
+ */
+function chunkOfWorld(wx: number, wz: number): number {
+  const y = -wz;
+  if (wx > 80) return y < GATE_ROW + 0.5 ? 7 : 6;
+  const { sx, sy } = screenOf(wx, y);
+  return sy * 3 + sx;
+}
+/** distance (map tiles) from a map-space point to a chunk's rectangle */
+function chunkDist(chunk: number, map: MapId, x: number, y: number): number {
+  let x0: number, x1: number, y0: number, y1: number;
+  if (chunk >= 6) {
+    if (map !== "dungeon") return Infinity;
+    x0 = 0; x1 = 16;
+    [y0, y1] = chunk === 7 ? [0, GATE_ROW + 0.5] : [GATE_ROW + 0.5, 23];
+  } else {
+    if (map !== "over") return Infinity;
+    x0 = (chunk % 3) * 16; x1 = x0 + 16;
+    y0 = Math.floor(chunk / 3) * 12; y1 = y0 + 12;
+  }
+  const dx = Math.max(x0 - x, 0, x - x1), dy = Math.max(y0 - y, 0, y - y1);
+  return Math.hypot(dx, dy);
+}
+
+/** Sway weights are baked into vertex alpha as a fraction of this many world units. */
+const SWAY_MAX = 0.14;
+
+interface BakeBucket {
+  group: string;
+  chunk: number;
+  pos: number[];
+  nrm: number[];
+  col: number[];
+  idx: number[];
+}
+const bv = new Vector3();
+
+/** Where one input matrix of a chunked thin-instance set ended up. */
+interface ThinSlot {
+  mesh: Mesh;
+  idx: number;
 }
 
 // Palette: each area has its own grass tone.
@@ -158,6 +211,26 @@ export class GameView {
   private laneYaw = 0;
   private laneAlpha = 0;
   private tmpV = new Vector3();
+  private tmpV2 = new Vector3();
+  private staticCasters: { mesh: Mesh; chunk: number; on: boolean }[] = [];
+  private buckets = new Map<string, BakeBucket>();
+  private shadowKey = -1;
+  private sceneInst: SceneInstrumentation | null = null;
+  private engineInst: EngineInstrumentation | null = null;
+  private baseScale = 1;
+  private hwScale = 1;
+  private adaptive = true;
+  private fpsAcc = 0;
+  private fpsN = 0;
+  private adaptT = 0;
+  private waterMat!: StandardMaterial;
+  private shimmer!: Texture;
+  private swayMats: StandardMaterial[] = [];
+  private dynamicMats = new Set<StandardMaterial>();
+  private seenA = new Set<number>();
+  private seenB = new Set<number>();
+  private dirty = new Set<Mesh>();
+  private evOut: GameEvent[] = [];
   private puddleMeshes = new Map<number, AbstractMesh>();
   private particles: Particle[] = [];
   private particleMesh: Mesh;
@@ -173,10 +246,41 @@ export class GameView {
 
   constructor(canvas: HTMLCanvasElement) {
     this.engine = new Engine(canvas, true, { preserveDrawingBuffer: true, stencil: true, antialias: true }, true);
-    this.engine.setHardwareScalingLevel(1 / Math.min(window.devicePixelRatio || 1, 2));
+    this.baseScale = this.hwScale = 1 / Math.min(window.devicePixelRatio || 1, 2);
+    this.engine.setHardwareScalingLevel(this.hwScale);
+    // automation renders on a software GPU: keep full resolution there so screenshots stay sharp
+    this.adaptive = !navigator.webdriver || location.search.includes("adaptive=1");
     const scene = (this.scene = new Scene(this.engine));
     scene.clearColor = Color4.FromHexString("#f4c79aff");
     scene.ambientColor = new Color3(0.2, 0.2, 0.2);
+    scene.skipPointerMovePicking = true;
+    scene.skipPointerDownPicking = true;
+    scene.skipPointerUpPicking = true;
+    // colour grading lives in the material shaders (no extra post-process pass)
+    const ip = scene.imageProcessingConfiguration;
+    ip.toneMappingEnabled = true;
+    ip.toneMappingType = ImageProcessingConfiguration.TONEMAPPING_ACES;
+    ip.exposure = 1.32;
+    ip.contrast = 1.12;
+    ip.colorCurvesEnabled = true;
+    const curves = new ColorCurves();
+    curves.globalSaturation = 22;
+    curves.shadowsHue = 265;
+    curves.shadowsDensity = 18;
+    curves.shadowsSaturation = 30;
+    curves.highlightsHue = 40;
+    curves.highlightsDensity = 12;
+    curves.highlightsSaturation = 25;
+    ip.colorCurves = curves;
+    ip.vignetteEnabled = true;
+    ip.vignetteWeight = 1.6;
+    ip.vignetteStretch = 0.35;
+    ip.vignetteColor = new Color4(0.12, 0.04, 0.16, 0);
+    ip.vignetteBlendMode = ImageProcessingConfiguration.VIGNETTEMODE_MULTIPLY;
+    ip.vignetteCameraFov = 0.72;
+    scene.fogMode = Scene.FOGMODE_EXP2;
+    scene.fogDensity = 0.012;
+    scene.fogColor = hex("#f4c79a");
 
     this.camera = new FreeCamera("cam", new Vector3(SPAWN.x, 12, -SPAWN.y - 8), scene);
     this.camera.fov = 0.72;
@@ -190,23 +294,26 @@ export class GameView {
     this.sun.shadowFrustumSize = 30;
     this.sun.shadowMinZ = 1;
     this.sun.shadowMaxZ = 80;
-    this.shadows = new ShadowGenerator(2048, this.sun);
+    const coarse = matchMedia("(pointer: coarse)").matches;
+    this.shadows = new ShadowGenerator(coarse ? 1024 : 2048, this.sun);
     this.shadows.usePercentageCloserFiltering = true;
     this.shadows.filteringQuality = ShadowGenerator.QUALITY_MEDIUM;
     this.shadows.bias = 0.0015;
     this.shadows.normalBias = 0.01;
     this.shadows.darkness = 0.35;
 
-    const glow = (this.glow = new GlowLayer("glow", scene, { blurKernelSize: 32 }));
+    const glow = (this.glow = new GlowLayer("glow", scene, { blurKernelSize: 32, mainTextureRatio: 0.4 }));
     glow.intensity = 0.55;
+    // only things that actually glow are drawn into the glow pass (it used to redraw the whole scene)
+    glow.addIncludedOnlyMesh(new Mesh("glowAnchor", scene));
 
     this.buildBackdrop();
     this.buildGround(OVERWORLD);
     this.buildGround(DUNGEON);
     this.water = this.buildWater();
-    this.glow.addExcludedMesh(this.water);
     this.buildOverworldProps();
     this.buildDungeonProps();
+    this.flushBakes();
     const tuftPot = this.buildBreakables();
     this.tuftMesh = tuftPot.tuft;
     this.potMesh = tuftPot.pot;
@@ -328,7 +435,19 @@ export class GameView {
     pm.thinInstanceSetBuffer("matrix", this.particleMatrices, 16, false);
     pm.thinInstanceSetBuffer("color", this.particleColors, 4, false);
     pm.alwaysSelectAsActiveMesh = true;
+    pm.isPickable = false;
     this.particleMesh = pm;
+
+    for (const m of [...this.flames, ...this.stars, this.globBase, this.ringBase, this.laneFill, this.laneHead, this.keyMesh, pm, this.rupeeG, this.rupeeB, this.heartMesh])
+      this.glow.addIncludedOnlyMesh(m);
+    for (const name of ["rune", "win"]) {
+      const m = scene.getMeshByName(name);
+      if (m) this.glow.addIncludedOnlyMesh(m as Mesh);
+    }
+    // materials whose uniforms we change after startup stay live; everything else is frozen
+    for (const m of [this.laneBgMat, this.laneFillMat, this.waterMat, ...this.swayMats]) this.dynamicMats.add(m);
+    for (const mesh of [this.heroBody, ...this.swordPivot.getChildMeshes()]) if (mesh.material instanceof StandardMaterial) this.dynamicMats.add(mesh.material);
+    for (const m of scene.materials) if (m instanceof StandardMaterial && !this.dynamicMats.has(m)) m.freeze();
   }
 
   // ───────────── static world ─────────────
@@ -344,7 +463,19 @@ export class GameView {
   }
 
   private groundColor(map: MapData, t: number, x: number, y: number): Color3 {
-    const v = 1 + (hash2(x, y, 9) - 0.5) * 0.09;
+    // ambient occlusion: darken floor tiles hugged by walls / trees / rocks / hedges
+    let occ = 0;
+    for (let dy = -1; dy <= 1; dy++)
+      for (let dx = -1; dx <= 1; dx++) {
+        if (!dx && !dy) continue;
+        const nx = x + dx, ny = y + dy;
+        if (nx < 0 || ny < 0 || nx >= map.w || ny >= map.h) continue;
+        const nt = map.tiles[ny * map.w + nx];
+        const solid = map.id === "dungeon" ? nt === Tile.WALL : nt === Tile.TREE || nt === Tile.ROCK || nt === Tile.HEDGE;
+        if (solid) occ += dx && dy ? 0.6 : 1;
+      }
+    const ao = 1 - Math.min(0.3, occ * (map.id === "dungeon" ? 0.07 : 0.045));
+    const v = (1 + (hash2(x, y, 9) - 0.5) * 0.09) * ao;
     let c: Color3;
     if (map.id === "dungeon") {
       const checker = (x + y) % 2 === 0 ? 1 : 0.92;
@@ -363,12 +494,11 @@ export class GameView {
 
   private buildGround(map: MapData) {
     const s = this.scene;
-    const byKind: Record<string, { m: number[]; c: number[]; h: number; top: number }> = {};
+    const byKind: Record<string, { m: Matrix[]; c: number[]; h: number; top: number }> = {};
     const push = (k: string, h: number, top: number, x: number, y: number, col: Color3) => {
       if (!byKind[k]) byKind[k] = { m: [], c: [], h, top };
-      const p = toWorld(map.id, x + 0.5, y + 0.5, top - h / 2);
-      const mat = compose(p.x, p.y, p.z, new Vector3(1, h, 1));
-      byKind[k].m.push(...mat.asArray());
+      const p = toWorld(map.id, x + 0.5, y + 0.5, top - h / 2, this.tmpV);
+      byKind[k].m.push(compose(p.x, p.y, p.z, this.tmpV2.set(1, h, 1)));
       byKind[k].c.push(col.r, col.g, col.b, 1);
     };
     for (let y = 0; y < map.h; y++)
@@ -397,34 +527,30 @@ export class GameView {
         const top = t === Tile.PATH || t === Tile.DOOR ? -0.015 : 0;
         push(t === Tile.PATH ? "path" : "grass", 0.6, top, x, y, this.groundColor(map, t, x, y));
       }
+    // every tile is the same unit box: bake them all into one ground (and one wall) mesh per chunk
+    const box = MeshBuilder.CreateBox(`${map.id}-tile`, { size: 1 }, s);
     for (const [k, d] of Object.entries(byKind)) {
-      const box = MeshBuilder.CreateBox(`${map.id}-${k}`, { size: 1 }, s);
       const isWall = k.startsWith("wall") || k === "pillar";
-      const mat = material(s, `${map.id}-${k}-mat`, "#ffffff", { spec: k === "plank" ? 0.1 : 0.02 });
-      box.material = mat;
-      box.thinInstanceSetBuffer("matrix", new Float32Array(d.m), 16, true);
-      box.thinInstanceSetBuffer("color", new Float32Array(d.c), 4, true);
-      box.receiveShadows = true;
-      if (isWall || k === "plank") this.shadows.addShadowCaster(box);
-      box.freezeWorldMatrix();
+      this.bake(isWall ? "walls" : "ground", box, d.m, { colors: d.c });
     }
     if (map.id === "dungeon") {
       // wall caps for a bit of definition
-      const caps: number[] = [];
+      const caps: Matrix[] = [];
       for (let y = 0; y < map.h; y++)
         for (let x = 0; x < map.w; x++) {
           if (map.tiles[y * map.w + x] !== Tile.WALL) continue;
           const southWall = y === GATE_ROW || y === map.h - 1;
           const isPillar = x > 0 && x < map.w - 1 && y > 0 && y < map.h - 1 && y !== GATE_ROW;
           const h = southWall ? 0.6 : isPillar ? 1.5 : 2.2;
-          const p = toWorld("dungeon", x + 0.5, y + 0.5, h + 0.04);
-          caps.push(...compose(p.x, p.y, p.z, new Vector3(1.04, 0.08, 1.04)).asArray());
+          const p = toWorld("dungeon", x + 0.5, y + 0.5, h + 0.04, this.tmpV);
+          caps.push(compose(p.x, p.y, p.z, this.tmpV2.set(1.04, 0.08, 1.04)));
         }
-      const cap = MeshBuilder.CreateBox("wallcap", { size: 1 }, s);
-      cap.material = material(s, "wallcap-mat", "#7c768c");
-      cap.thinInstanceSetBuffer("matrix", new Float32Array(caps), 16, true);
-      cap.receiveShadows = true;
+      const capCol = hex("#7c768c");
+      const cc: number[] = [];
+      for (let i = 0; i < caps.length; i++) cc.push(capCol.r, capCol.g, capCol.b, 1);
+      this.bake("walls", box, caps, { colors: cc });
     }
+    box.dispose();
   }
 
   private buildWater(): Mesh {
@@ -433,23 +559,145 @@ export class GameView {
     w.position.set(24, -0.14, -12);
     const m = material(s, "water-mat", "#0c3a48", { spec: 0.8, alpha: 0.88 });
     m.specularPower = 48;
-    m.emissiveColor = hex("#06262c");
+    m.emissiveColor = hex("#0a3238");
+    // animated shimmer: a tiling streak texture scrolled in two directions (see sync)
+    this.shimmer = makeShimmerTexture(s);
+    this.shimmer.uScale = 9;
+    this.shimmer.vScale = 4.5;
+    this.shimmer.level = 0.35;
+    m.emissiveTexture = this.shimmer;
+    this.waterMat = m;
     w.material = m;
     w.receiveShadows = true;
     return w;
   }
 
-  /** `dynamic` must be true for instances we later hide/move (static buffers are never re-uploaded). */
-  private thin(mesh: Mesh, mats: Matrix[], cast = true, dynamic = false) {
+  /**
+   * Static batching: transform `mesh`'s vertices by every matrix and append them to the bucket of
+   * (group, chunk). Vertex colour = template colour × instance colour; alpha = sway weight
+   * (local height² × `sway`, as a fraction of SWAY_MAX) for the foliage shader.
+   */
+  private bake(group: string, mesh: Mesh, mats: Matrix[], opts: { colors?: number[]; sway?: number } = {}) {
+    const P = mesh.getVerticesData(VertexBuffer.PositionKind)!;
+    const N = mesh.getVerticesData(VertexBuffer.NormalKind)!;
+    const C = mesh.getVerticesData(VertexBuffer.ColorKind);
+    const I = mesh.getIndices()!;
+    const nv = P.length / 3;
+    mats.forEach((m, mi) => {
+      const chunk = chunkOfWorld(m.m[12], m.m[14]);
+      const key = `${group}|${chunk}`;
+      let b = this.buckets.get(key);
+      if (!b) this.buckets.set(key, (b = { group, chunk, pos: [], nrm: [], col: [], idx: [] }));
+      const base = b.pos.length / 3;
+      const ir = opts.colors ? opts.colors[mi * 4] : 1, ig = opts.colors ? opts.colors[mi * 4 + 1] : 1, ib = opts.colors ? opts.colors[mi * 4 + 2] : 1;
+      for (let v = 0; v < nv; v++) {
+        Vector3.TransformCoordinatesFromFloatsToRef(P[v * 3], P[v * 3 + 1], P[v * 3 + 2], m, bv);
+        b.pos.push(bv.x, bv.y, bv.z);
+        Vector3.TransformNormalFromFloatsToRef(N[v * 3], N[v * 3 + 1], N[v * 3 + 2], m, bv);
+        bv.normalize();
+        b.nrm.push(bv.x, bv.y, bv.z);
+        const y = Math.max(0, P[v * 3 + 1]);
+        const w = opts.sway ? Math.min(1, (opts.sway * y * y) / SWAY_MAX) : 0;
+        b.col.push((C ? C[v * 4] : 1) * ir, (C ? C[v * 4 + 1] : 1) * ig, (C ? C[v * 4 + 2] : 1) * ib, w);
+      }
+      for (let i = 0; i < I.length; i++) b.idx.push(I[i] + base);
+    });
+  }
+
+  private flushBakes() {
+    const s = this.scene;
+    const mats: Record<string, StandardMaterial> = {};
+    const matFor = (group: string) => {
+      if (mats[group]) return mats[group];
+      const m = material(s, `baked-${group}-mat`, "#ffffff", { spec: group === "ground" ? 0.02 : group === "walls" ? 0.04 : 0.05, backFace: group !== "flora" });
+      if (group === "scenery" || group === "flora") {
+        new SwayPlugin(m, SWAY_MAX, "alpha");
+        this.swayMats.push(m);
+      }
+      return (mats[group] = m);
+    };
+    for (const b of this.buckets.values()) {
+      const mesh = new Mesh(`${b.group}#${b.chunk}`, s);
+      const vd = new VertexData();
+      vd.positions = b.pos;
+      vd.normals = b.nrm;
+      vd.colors = b.col;
+      vd.indices = b.idx;
+      vd.applyToMesh(mesh, false);
+      mesh.hasVertexAlpha = false;
+      mesh.material = matFor(b.group);
+      mesh.receiveShadows = true;
+      mesh.isPickable = false;
+      mesh.freezeWorldMatrix();
+      if (b.group === "scenery" || b.group === "walls") this.staticCasters.push({ mesh, chunk: b.chunk, on: false });
+    }
+    this.buckets.clear();
+  }
+
+  /**
+   * Thin instances, split per chunk (screen / room): one clone of `mesh` (shared geometry and
+   * material) per chunk, each with a tight bounding box so off-screen chunks are frustum-culled
+   * and only nearby chunks cast shadows. `dynamic` must be true for instances we later hide/move
+   * (static buffers are never re-uploaded). Returns where each input matrix landed.
+   */
+  private thin(mesh: Mesh, mats: Matrix[], cast = true, dynamic = false, colors?: number[]): ThinSlot[] {
+    const out: ThinSlot[] = new Array(mats.length);
     if (!mats.length) {
       mesh.setEnabled(false);
-      return;
+      return out;
     }
-    const buf = new Float32Array(mats.length * 16);
-    mats.forEach((m, i) => m.copyToArray(buf, i * 16));
-    mesh.thinInstanceSetBuffer("matrix", buf, 16, !dynamic);
-    mesh.receiveShadows = true;
-    if (cast) this.shadows.addShadowCaster(mesh);
+    const groups = new Map<number, number[]>();
+    mats.forEach((m, i) => {
+      const k = chunkOfWorld(m.m[12], m.m[14]);
+      let g = groups.get(k);
+      if (!g) groups.set(k, (g = []));
+      g.push(i);
+    });
+    // clone BEFORE any buffers exist, and give every clone its own geometry: thin-instance buffers
+    // are bound through the geometry's vertex buffers, so shared geometry would make chunks clobber each other
+    const keys = [...groups.keys()];
+    const base = mesh.name;
+    const meshes = keys.map((k, i) => {
+      const cm = i === 0 ? mesh : (mesh.clone(`${base}#${k}`) as Mesh);
+      if (i > 0) cm.makeGeometryUnique();
+      return cm;
+    });
+    mesh.name = `${base}#${keys[0]}`;
+    for (let gi = 0; gi < keys.length; gi++) {
+      const k = keys[gi], idxs = groups.get(k)!, cm = meshes[gi];
+      const buf = new Float32Array(idxs.length * 16);
+      idxs.forEach((src, j) => {
+        mats[src].copyToArray(buf, j * 16);
+        out[src] = { mesh: cm, idx: j };
+      });
+      cm.thinInstanceSetBuffer("matrix", buf, 16, !dynamic);
+      if (colors) {
+        const cb = new Float32Array(idxs.length * 4);
+        idxs.forEach((src, j) => cb.set(colors.slice(src * 4, src * 4 + 4), j * 4));
+        cm.thinInstanceSetBuffer("color", cb, 4, true);
+      }
+      cm.thinInstanceRefreshBoundingInfo(false);
+      cm.receiveShadows = true;
+      cm.isPickable = false;
+      cm.freezeWorldMatrix();
+      if (cast) this.staticCasters.push({ mesh: cm, chunk: k, on: false });
+    }
+    return out;
+  }
+
+  /** Only chunks near the camera go into the shadow map (it has no frustum culling of its own). */
+  private updateShadowCasters(map: MapId, x: number, y: number) {
+    let key = 0;
+    for (let c = 0; c < 8; c++) if (chunkDist(c, map, x, y) < 9) key |= 1 << c;
+    if (key === this.shadowKey) return;
+    this.shadowKey = key;
+    for (const sc of this.staticCasters) {
+      const want = (key & (1 << sc.chunk)) !== 0;
+      if (want === sc.on) continue;
+      sc.on = want;
+      if (want) this.shadows.addShadowCaster(sc.mesh, false);
+      else this.shadows.removeShadowCaster(sc.mesh, false);
+    }
   }
 
   private buildOverworldProps() {
@@ -475,6 +723,9 @@ export class GameView {
     const bloomM: Matrix[][] = [[], [], [], []];
     const deco = makeTuft(s, "decoTuft", "#4f8a3c", "#a9d46a", 6, 8);
     const decoM: Matrix[] = [];
+    for (const t of [...pines, ...autumn]) bakeHeightAO(t, 0.38, 0.5);
+    rocks.forEach((r) => bakeHeightAO(r, 0.3, 0.6));
+    bakeHeightAO(hedge, 0.32, 0.7);
 
     for (let y = 0; y < m.h; y++)
       for (let x = 0; x < m.w; x++) {
@@ -517,16 +768,29 @@ export class GameView {
           if (rnd() < 0.35) decoM.push(compose(p.x + (rnd() - 0.5) * 0.8, 0, p.z + (rnd() - 0.5) * 0.8, 0.4 + rnd() * 0.35, rnd() * 6.28));
         }
       }
-    [...pines, ...autumn].forEach((mesh, i) => this.thin(mesh, treeM[i]));
-    rocks.forEach((mesh, i) => this.thin(mesh, rockM[i]));
-    this.thin(hedge, hedgeM);
-    blooms.forEach((mesh, i) => this.thin(mesh, bloomM[i], false));
-    this.thin(deco, decoM, false);
+    // static scenery is baked per chunk: one "scenery" mesh (trees, rocks, hedges — casts shadows)
+    // and one "flora" mesh (flowers, grass tufts) per screen, each with its own sway weights
+    [...pines, ...autumn].forEach((mesh, i) => this.bake("scenery", mesh, treeM[i], { sway: 0.02 }));
+    rocks.forEach((mesh, i) => this.bake("scenery", mesh, rockM[i]));
+    this.bake("scenery", hedge, hedgeM, { sway: 0.03 });
+    blooms.forEach((mesh, i) => this.bake("flora", mesh, bloomM[i], { sway: 0.9 }));
+    this.bake("flora", deco, decoM, { sway: 0.7 });
+    for (const m of [...pines, ...autumn, ...rocks, hedge, ...blooms, deco]) {
+      m.material?.dispose();
+      m.dispose();
+    }
 
     this.buildCottage(toWorld("over", 18.5, 15));
     this.buildWell(toWorld("over", 27.5, 14.5));
     this.buildArch(toWorld("over", 24, 2.5));
     this.buildSign(toWorld("over", 21.4, 4.3));
+  }
+
+  private sway(mesh: Mesh, amp: number) {
+    const m = mesh.material;
+    if (!(m instanceof StandardMaterial) || this.swayMats.includes(m)) return;
+    new SwayPlugin(m, amp);
+    this.swayMats.push(m);
   }
 
   private buildCottage(at: Vector3) {
@@ -552,6 +816,7 @@ export class GameView {
     paintFacets(chimney, hex("#8d7b6a"), 0.08, 4);
     parts.push(chimney);
     const m = merge(parts, "cottage");
+    bakeHeightAO(m, 0.3, 0.35);
     m.material = material(s, "cottage-mat", "#ffffff");
     m.position = at.add(new Vector3(0, 0, 0));
     m.receiveShadows = true;
@@ -749,24 +1014,27 @@ export class GameView {
   private initBreakables(state: GameState) {
     if (!this.pendingBreakables) return;
     const { tuft, pot, rnd } = this.pendingBreakables;
-    const tMats: Matrix[] = [];
-    const pMats: Matrix[] = [];
+    const tMats: Matrix[] = [], tIds: number[] = [];
+    const pMats: Matrix[] = [], pIds: number[] = [];
+    bakeHeightAO(pot, 0.3, 0.5);
+    this.sway(tuft, 0.8);
     for (const b of state.breakables) {
       const p = toWorld(b.map, b.x, b.y);
       if (b.kind === "tuft") {
-        const m = compose(p.x, 0, p.z, 0.9 + rnd() * 0.5, rnd() * 6.28);
-        this.breakIndex.set(b.id, { mesh: tuft, idx: tMats.length, matrix: m, shown: true });
-        tMats.push(m);
+        tMats.push(compose(p.x, 0, p.z, 0.9 + rnd() * 0.5, rnd() * 6.28).clone());
+        tIds.push(b.id);
       } else {
         const sc = 0.9 + rnd() * 0.25;
-        const m = compose(p.x, 0, p.z, new Vector3(sc, sc * (0.9 + rnd() * 0.25), sc), rnd() * 6.28, (rnd() - 0.5) * 0.08);
-        this.breakIndex.set(b.id, { mesh: pot, idx: pMats.length, matrix: m, shown: true });
-        pMats.push(m);
+        pMats.push(compose(p.x, 0, p.z, new Vector3(sc, sc * (0.9 + rnd() * 0.25), sc), rnd() * 6.28, (rnd() - 0.5) * 0.08).clone());
+        pIds.push(b.id);
       }
     }
-    this.thin(tuft, tMats, false, true);
-    this.thin(pot, pMats, true, true);
-    tuft.thinInstanceRefreshBoundingInfo();
+    const ts = this.thin(tuft, tMats, false, true);
+    const ps = this.thin(pot, pMats, true, true);
+    ts.forEach((sl, i) => this.breakIndex.set(tIds[i], { mesh: sl.mesh, idx: sl.idx, matrix: tMats[i], shown: true }));
+    ps.forEach((sl, i) => this.breakIndex.set(pIds[i], { mesh: sl.mesh, idx: sl.idx, matrix: pMats[i], shown: true }));
+    for (const sc of this.staticCasters) sc.on = false;
+    this.shadowKey = -1; // re-evaluate with the pots included
     this.pendingBreakables = null;
   }
 
@@ -818,11 +1086,36 @@ export class GameView {
     this.syncHazards(state);
     this.updateParticles(dt);
     this.water.position.y = -0.14 + Math.sin(this.time * 1.3) * 0.015;
+    this.shimmer.uOffset = this.time * 0.035;
+    this.shimmer.vOffset = Math.sin(this.time * 0.4) * 0.05;
+    swayClock.t = this.time;
     this.syncCamera(state, dt);
+    this.adaptResolution(dt);
+  }
+
+  /** Adaptive resolution: drop render scale when we can't hold ~45 fps, restore when there's headroom. */
+  private adaptResolution(dt: number) {
+    if (!this.adaptive || dt <= 0) return;
+    this.fpsAcc += dt;
+    this.fpsN++;
+    this.adaptT += dt;
+    if (this.adaptT < 2) return;
+    const fps = this.fpsN / this.fpsAcc;
+    this.adaptT = this.fpsAcc = 0;
+    this.fpsN = 0;
+    let next = this.hwScale;
+    if (fps < 45) next = Math.min(this.baseScale * 2, this.hwScale * 1.2);
+    else if (fps > 57) next = Math.max(this.baseScale, this.hwScale / 1.1);
+    if (Math.abs(next - this.hwScale) > 1e-3) {
+      this.hwScale = next;
+      this.engine.setHardwareScalingLevel(next);
+    }
   }
 
   newEvents(state: GameState): GameEvent[] {
-    const out = state.events.filter((e) => e.seq > this.lastSeq);
+    const out = this.evOut;
+    out.length = 0;
+    for (const e of state.events) if (e.seq > this.lastSeq) out.push(e);
     if (out.length) this.lastSeq = out[out.length - 1].seq;
     return out;
   }
@@ -833,6 +1126,8 @@ export class GameView {
     this.camTarget.copyFrom(toWorld(map, p.x, p.y));
     if (map === "over") {
       this.scene.clearColor = Color4.FromHexString("#f4c79aff");
+      this.scene.fogColor = hex("#f2c9a0");
+      this.scene.fogDensity = 0.011;
       this.hemi.intensity = 0.72;
       this.hemi.diffuse = hex("#fff1dc");
       this.hemi.groundColor = hex("#5a6b4a");
@@ -841,6 +1136,8 @@ export class GameView {
       this.roomLights.forEach((l) => (l.intensity = 0));
     } else {
       this.scene.clearColor = Color4.FromHexString("#09070dff");
+      this.scene.fogColor = hex("#0b0812");
+      this.scene.fogDensity = 0.022;
       this.hemi.intensity = 0.32;
       this.hemi.diffuse = hex("#9c8cc8");
       this.hemi.groundColor = hex("#1a1426");
@@ -852,7 +1149,7 @@ export class GameView {
 
   private syncHero(state: GameState, dt: number) {
     const p = state.player;
-    const pos = toWorld(p.map, p.x, p.y);
+    const pos = toWorld(p.map, p.x, p.y, 0, this.tmpV);
     const speed = Math.hypot(p.vx, p.vy);
     this.walkPhase += speed * dt * 3.2;
     const bob = speed > 0.3 ? Math.abs(Math.sin(this.walkPhase)) * 0.07 : Math.sin(this.time * 2) * 0.01;
@@ -902,7 +1199,9 @@ export class GameView {
       this.arcPositions[o + 5] = cz * ro;
       const c = i * 8;
       const fade = alpha * (0.15 + 0.85 * t);
-      this.arcColors.set([0.85, 0.95, 1, fade * 0.25, 1, 1, 1, fade * 0.85], c);
+      const ac = this.arcColors;
+      ac[c] = 0.85; ac[c + 1] = 0.95; ac[c + 2] = 1; ac[c + 3] = fade * 0.25;
+      ac[c + 4] = 1; ac[c + 5] = 1; ac[c + 6] = 1; ac[c + 7] = fade * 0.85;
     }
     this.arc.updateVerticesData(VertexBuffer.PositionKind, this.arcPositions);
     this.arc.updateVerticesData(VertexBuffer.ColorKind, this.arcColors);
@@ -920,6 +1219,7 @@ export class GameView {
         mesh.material = mat;
         mesh.receiveShadows = true;
         this.shadows.addShadowCaster(mesh);
+        this.glow.addIncludedOnlyMesh(mesh);
         const s = e.kind === "boss" ? 1.95 : 0.95;
         root.scaling.setAll(s);
         v = { root, mesh, mat, wasAlive: e.alive, spawnT: 1, yaw: 0 };
@@ -933,7 +1233,7 @@ export class GameView {
         continue;
       }
       v.spawnT = Math.min(1, v.spawnT + dt * 3);
-      const pos = toWorld(e.map, e.x, e.y);
+      const pos = toWorld(e.map, e.x, e.y, 0, this.tmpV);
       v.root.position.copyFrom(pos);
       const p = state.player;
       const look = Math.atan2(p.x - e.x, -(p.y - e.y));
@@ -1016,7 +1316,8 @@ export class GameView {
   }
 
   private syncPickups(state: GameState) {
-    const seen = new Set<number>();
+    const seen = this.seenA;
+    seen.clear();
     for (const k of state.pickups) {
       seen.add(k.id);
       let m = this.pickupMeshes.get(k.id);
@@ -1024,10 +1325,10 @@ export class GameView {
         const base = k.kind === "heart" ? this.heartMesh : k.value > 1 ? this.rupeeB : this.rupeeG;
         m = base.createInstance("pk" + k.id);
         this.shadows.addShadowCaster(m);
+        this.glow.addIncludedOnlyMesh(m as Mesh);
         this.pickupMeshes.set(k.id, m);
       }
-      const pos = toWorld(k.map, k.x, k.y, 0.32 + k.z + Math.sin(this.time * 4 + k.id) * 0.05);
-      m.position.copyFrom(pos);
+      toWorld(k.map, k.x, k.y, 0.32 + k.z + Math.sin(this.time * 4 + k.id) * 0.05, m.position);
       m.rotation.y = this.time * 3 + k.id;
       m.isVisible = k.life > 3 || Math.floor(k.life * 10) % 2 === 0;
     }
@@ -1040,7 +1341,8 @@ export class GameView {
   }
 
   private syncBreakables(state: GameState) {
-    const dirty = new Set<Mesh>();
+    const dirty = this.dirty;
+    dirty.clear();
     for (const b of state.breakables) {
       const e = this.breakIndex.get(b.id);
       if (!e || e.shown === b.alive) continue;
@@ -1077,7 +1379,8 @@ export class GameView {
   }
 
   private syncHazards(state: GameState) {
-    const seen = new Set<number>();
+    const seen = this.seenA;
+    seen.clear();
     for (const g of state.globs) {
       seen.add(g.id);
       let m = this.globMeshes.get(g.id);
@@ -1086,6 +1389,8 @@ export class GameView {
         m.ball.instancedBuffers.color = new Color4(1, 1, 1, 1);
         m.ring.instancedBuffers.color = new Color4(1, 1, 1, 1);
         m.disc.instancedBuffers.color = new Color4(1, 1, 1, 1);
+        this.glow.addIncludedOnlyMesh(m.ball as Mesh);
+        this.glow.addIncludedOnlyMesh(m.ring as Mesh);
         this.shadows.addShadowCaster(m.ball);
         this.globMeshes.set(g.id, m);
       }
@@ -1141,7 +1446,8 @@ export class GameView {
         m.disc.dispose();
         this.globMeshes.delete(id);
       }
-    const seenP = new Set<number>();
+    const seenP = this.seenB;
+    seenP.clear();
     for (const q of state.puddles) {
       seenP.add(q.id);
       let m = this.puddleMeshes.get(q.id);
@@ -1149,7 +1455,7 @@ export class GameView {
         m = this.puddleBase.createInstance("pd" + q.id);
         this.puddleMeshes.set(q.id, m);
       }
-      m.position.copyFrom(toWorld("dungeon", q.x, q.y, 0.03));
+      toWorld("dungeon", q.x, q.y, 0.03, m.position);
       const k = q.r * Math.min(1, (q.max - q.life) * 8) * Math.min(1, q.life * 2.5);
       m.scaling.set(k * (1 + Math.sin(this.time * 9 + q.id) * 0.05), 1, k);
       if (Math.random() < 0.15) this.emit(q.x, q.y, "dungeon", 1, { c: hex("#7ad04a"), speed: 0.3, up: 1.2, g: 0.5, life: 0.5, size: 0.06, h: 0.05 });
@@ -1173,7 +1479,7 @@ export class GameView {
       tx = Math.min(10, Math.max(6, tx));
       ty = Math.min(map.h - 3.2, Math.max(4.5, ty));
     }
-    const want = toWorld(p.map, tx, ty);
+    const want = toWorld(p.map, tx, ty, 0, this.tmpV);
     const k = 1 - Math.exp(-dt * 6);
     this.camTarget.x += (want.x - this.camTarget.x) * k;
     this.camTarget.z += (want.z - this.camTarget.z) * k;
@@ -1182,10 +1488,12 @@ export class GameView {
     const ox = (Math.random() - 0.5) * sh * 1.2, oy = (Math.random() - 0.5) * sh * 1.2;
     // classic Zelda tilt: high and behind, looking down at ~55°
     this.camera.position.set(this.camTarget.x + ox, 11.2 + oy, this.camTarget.z - 7.7);
-    this.camera.setTarget(new Vector3(this.camTarget.x + ox, 0, this.camTarget.z + 0.2));
+    this.camera.setTarget(this.tmpV2.set(this.camTarget.x + ox, 0, this.camTarget.z + 0.2));
     // sun + shadow frustum follow the action
-    const c = new Vector3(this.camTarget.x, 0, this.camTarget.z + 2);
-    this.sun.position = c.subtract(this.sun.direction.scale(30));
+    this.sun.direction.scaleToRef(-30, this.tmpV);
+    this.sun.position.set(this.camTarget.x + this.tmpV.x, this.tmpV.y, this.camTarget.z + 2 + this.tmpV.z);
+    const mx = this.camTarget.x - MAP_OFFSET[p.map];
+    this.updateShadowCasters(p.map, mx, -this.camTarget.z);
   }
 
   // ───────────── effects ─────────────
@@ -1252,7 +1560,8 @@ export class GameView {
         const t = p.life / p.max;
         const s = Math.max(0.001, p.size * (p.grow ? 1 + (1 - t) * p.grow : Math.min(1, t * 2)));
         compose(p.x, p.y, p.z, s, p.spin, p.spin * 0.7).copyToArray(this.particleMatrices, i * 16);
-        this.particleColors.set([p.c.r, p.c.g, p.c.b, 1], i * 4);
+        const pc = this.particleColors, o = i * 4;
+        pc[o] = p.c.r; pc[o + 1] = p.c.g; pc[o + 2] = p.c.b; pc[o + 3] = 1;
       } else ZERO.copyToArray(this.particleMatrices, i * 16);
     }
     this.particleMesh.thinInstanceBufferUpdated("matrix");
@@ -1351,6 +1660,50 @@ export class GameView {
 
   render() {
     this.scene.render();
+  }
+
+  /** Resize + portrait handling: in portrait keep the horizontal field of view instead of the vertical. */
+  resize() {
+    this.engine.resize();
+    const portrait = this.engine.getRenderHeight() > this.engine.getRenderWidth();
+    this.camera.fovMode = portrait ? Camera.FOVMODE_HORIZONTAL_FIXED : Camera.FOVMODE_VERTICAL_FIXED;
+    this.camera.fov = portrait ? 1.02 : 0.72;
+  }
+
+  /** Perf overlay: instrumentation is only attached while the overlay is on. */
+  setInstrumentation(on: boolean) {
+    if (on && !this.sceneInst) {
+      this.sceneInst = new SceneInstrumentation(this.scene);
+      this.sceneInst.captureFrameTime = true;
+      this.engineInst = new EngineInstrumentation(this.engine);
+      this.engineInst.captureGPUFrameTime = true;
+    } else if (!on && this.sceneInst) {
+      this.sceneInst.dispose();
+      this.engineInst?.dispose();
+      this.sceneInst = this.engineInst = null;
+    }
+  }
+
+  perfStats() {
+    const active = this.scene.getActiveMeshes();
+    let verts = 0;
+    for (let i = 0; i < active.length; i++) {
+      const m = active.data[i] as Mesh;
+      verts += m.getTotalVertices() * Math.max(1, m.thinInstanceCount || 0);
+    }
+    const gpu = this.engineInst?.gpuFrameTimeCounter.lastSecAverage ?? 0;
+    return {
+      fps: this.engine.getFps(),
+      // counters need a couple of completed frames before their numbers mean anything
+      frameMs: this.sceneInst && this.sceneInst.frameTimeCounter.count > 1 ? this.sceneInst.frameTimeCounter.lastSecAverage || this.sceneInst.frameTimeCounter.current : -1,
+      gpuMs: gpu > 0 ? gpu * 1e-6 : null,
+      drawCalls: this.sceneInst && this.sceneInst.drawCallsCounter.count > 1 ? this.sceneInst.drawCallsCounter.current : -1,
+      activeMeshes: active.length,
+      totalMeshes: this.scene.meshes.length,
+      tris: Math.round(this.scene.getActiveIndices() / 3),
+      verts,
+      hwScale: this.engine.getHardwareScalingLevel(),
+    };
   }
 
   dispose() {
