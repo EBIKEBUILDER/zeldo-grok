@@ -1,0 +1,16 @@
+@import "tailwindcss";
+
+html, body { height: 100%; margin: 0; background: #1b1424; overflow: hidden; }
+body { font-family: ui-rounded, "Trebuchet MS", system-ui, sans-serif; }
+
+@keyframes hurtflash { 0% { opacity: 1; } 100% { opacity: 0; } }
+.hurt-flash { animation: hurtflash 450ms ease-out forwards; }
+
+@keyframes bannerin { 0% { opacity: 0; transform: translateY(-8px); } 15% { opacity: 1; transform: none; } 80% { opacity: 1; } 100% { opacity: 0; } }
+.area-banner { animation: bannerin 2600ms ease-out forwards; }
+
+@keyframes popin { 0% { opacity: 0; transform: scale(.85); } 100% { opacity: 1; transform: none; } }
+.pop-in { animation: popin 350ms cubic-bezier(.2,1.4,.4,1) both; }
+
+@keyframes pulse-soft { 0%,100% { opacity: .55; } 50% { opacity: 1; } }
+.pulse-soft { animation: pulse-soft 1.6s ease-in-out infinite; }

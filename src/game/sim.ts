@@ -1,0 +1,701 @@
+/**
+ * Pure game simulation. Operates on plain serializable data (GameState) with a fixed timestep.
+ * No Babylon, no React, no DOM — so it runs identically in tests, at any frame rate.
+ */
+import * as C from "./constants";
+import { mulberry } from "./rng";
+import type { Breakable, Enemy, EventType, GameState, InputState, Pickup, Player } from "./types";
+import {
+  BREAKABLES,
+  BOSS_TRIGGER_Y,
+  CHEST,
+  DUNGEON_DOOR,
+  DUNGEON_ENEMIES,
+  DUNGEON_ENTRY,
+  GATE_ROW,
+  GATE_X,
+  MAPS,
+  OVER_DOOR,
+  OVER_DOOR_EXIT,
+  OVER_ENEMIES,
+  PEDESTAL,
+  SPAWN,
+  Tile,
+  areaName,
+  isSolidTile,
+  tileAt,
+  type MapId,
+} from "./world";
+
+const EVENT_KEEP = 96;
+
+export function createInitialState(seed = 12345): GameState {
+  let id = 1;
+  const enemies: Enemy[] = [...OVER_ENEMIES, ...DUNGEON_ENEMIES].map((s) => {
+    const boss = s.kind === "boss";
+    return {
+      id: id++,
+      kind: s.kind,
+      map: s.map,
+      x: s.x,
+      y: s.y,
+      vx: 0,
+      vy: 0,
+      homeX: s.x,
+      homeY: s.y,
+      r: boss ? C.BOSS_R : C.BLOB_R,
+      hp: boss ? C.BOSS_HP : C.BLOB_HP,
+      maxHp: boss ? C.BOSS_HP : C.BLOB_HP,
+      alive: true,
+      state: "idle",
+      stateT: 0.5 + (id % 5) * 0.3,
+      wx: 0,
+      wy: 0,
+      hitFlash: 0,
+      stun: 0,
+      contactCd: 0,
+      respawnT: 0,
+      lungeCd: 2.5,
+    };
+  });
+  const breakables: Breakable[] = BREAKABLES.map((b) => ({ id: id++, kind: b.kind, map: b.map, x: b.x, y: b.y, alive: true }));
+  const player: Player = {
+    map: "over",
+    x: SPAWN.x,
+    y: SPAWN.y,
+    vx: 0,
+    vy: 0,
+    fx: 0,
+    fy: 1,
+    hp: C.PLAYER_MAX_HP,
+    maxHp: C.PLAYER_MAX_HP,
+    rupees: 0,
+    invuln: 0,
+    knockT: 0,
+    swingT: 0,
+    swingCd: 0,
+    swingId: 0,
+    swingAngle: Math.PI / 2,
+    hitIds: [],
+    hurtCount: 0,
+    doorLock: false,
+  };
+  return {
+    phase: "title",
+    tick: 0,
+    time: 0,
+    rng: seed | 0,
+    nextId: id,
+    eventSeq: 0,
+    player,
+    enemies,
+    pickups: [],
+    breakables,
+    flags: { hasKey: false, gateOpen: false, bossAwake: false, bossDefeated: false, chestOpened: false },
+    message: null,
+    area: areaName("over", SPAWN.x, SPAWN.y),
+    victoryT: -1,
+    transitionCount: 0,
+    events: [],
+  };
+}
+
+// ───────────────────────────── helpers ─────────────────────────────
+const rand = (s: GameState) => mulberry(s);
+
+function emit(s: GameState, type: EventType, map: MapId, x: number, y: number, dx?: number, dy?: number) {
+  s.events.push({ seq: ++s.eventSeq, type, map, x, y, dx, dy });
+  if (s.events.length > EVENT_KEEP) s.events.splice(0, s.events.length - EVENT_KEEP);
+}
+
+function say(s: GameState, text: string, t = 2.6) {
+  s.message = { id: (s.message?.id ?? 0) + 1, text, t };
+}
+
+export function gateClosed(s: GameState): boolean {
+  // The gate is locked until the key is used, and slams shut while the Warden is fighting.
+  return !s.flags.gateOpen || (s.flags.bossAwake && !s.flags.bossDefeated);
+}
+
+export function chestVisible(s: GameState): boolean {
+  return s.flags.bossDefeated;
+}
+
+function solidAt(s: GameState, map: MapId, tx: number, ty: number): boolean {
+  return isSolidTile(tileAt(MAPS[map], tx, ty), gateClosed(s));
+}
+
+/** Does an axis-aligned box of half-size r centred at (x,y) overlap any solid tile? */
+export function boxHitsSolid(s: GameState, map: MapId, x: number, y: number, r: number): boolean {
+  const x0 = Math.floor(x - r), x1 = Math.floor(x + r - 1e-6);
+  const y0 = Math.floor(y - r), y1 = Math.floor(y + r - 1e-6);
+  for (let ty = y0; ty <= y1; ty++) for (let tx = x0; tx <= x1; tx++) if (solidAt(s, map, tx, ty)) return true;
+  return false;
+}
+
+interface Body {
+  map: MapId;
+  x: number;
+  y: number;
+}
+
+/** Axis-separated move against tiles — gives natural wall-sliding. Returns which axes were blocked. */
+export function moveBody(s: GameState, b: Body, dx: number, dy: number, r: number): { bx: boolean; by: boolean } {
+  let bx = false, by = false;
+  if (dx !== 0) {
+    const nx = b.x + dx;
+    if (!boxHitsSolid(s, b.map, nx, b.y, r)) b.x = nx;
+    else {
+      bx = true;
+      const snapped = dx > 0 ? Math.floor(nx + r) - r - 1e-4 : Math.floor(nx - r) + 1 + r + 1e-4;
+      if ((dx > 0 ? snapped >= b.x : snapped <= b.x) && !boxHitsSolid(s, b.map, snapped, b.y, r)) b.x = snapped;
+    }
+  }
+  if (dy !== 0) {
+    const ny = b.y + dy;
+    if (!boxHitsSolid(s, b.map, b.x, ny, r)) b.y = ny;
+    else {
+      by = true;
+      const snapped = dy > 0 ? Math.floor(ny + r) - r - 1e-4 : Math.floor(ny - r) + 1 + r + 1e-4;
+      if ((dy > 0 ? snapped >= b.y : snapped <= b.y) && !boxHitsSolid(s, b.map, b.x, snapped, r)) b.y = snapped;
+    }
+  }
+  return { bx, by };
+}
+
+interface Circle {
+  x: number;
+  y: number;
+  r: number;
+}
+/** Static round obstacles: pots, the key pedestal, the chest (once it exists). */
+function staticCircles(s: GameState, map: MapId): Circle[] {
+  const out: Circle[] = [];
+  for (const b of s.breakables) if (b.alive && b.kind === "pot" && b.map === map) out.push({ x: b.x, y: b.y, r: 0.32 });
+  if (map === "dungeon") {
+    out.push({ x: PEDESTAL.x, y: PEDESTAL.y, r: 0.42 });
+    if (chestVisible(s)) out.push({ x: CHEST.x, y: CHEST.y, r: 0.55 });
+  }
+  return out;
+}
+
+function pushOutOfCircles(s: GameState, b: Body, r: number, circles: Circle[]) {
+  for (const c of circles) {
+    const dx = b.x - c.x, dy = b.y - c.y;
+    const d = Math.hypot(dx, dy);
+    const min = r + c.r;
+    if (d < min) {
+      const nx = d > 1e-5 ? dx / d : 0, ny = d > 1e-5 ? dy / d : 1;
+      moveBody(s, b, nx * (min - d), ny * (min - d), r);
+    }
+  }
+}
+
+function len(x: number, y: number) {
+  return Math.hypot(x, y);
+}
+
+function angleDiff(a: number, b: number) {
+  let d = a - b;
+  while (d > Math.PI) d -= Math.PI * 2;
+  while (d < -Math.PI) d += Math.PI * 2;
+  return Math.abs(d);
+}
+
+function inSanctuary(map: MapId, x: number, y: number, pad = 0) {
+  return map === "over" && Math.hypot(x - SPAWN.x, y - SPAWN.y) < C.SAFE_RADIUS + pad;
+}
+
+// ───────────────────────────── drops ─────────────────────────────
+function spawnPickup(s: GameState, kind: Pickup["kind"], map: MapId, x: number, y: number, value = 1) {
+  const a = rand(s) * Math.PI * 2;
+  const sp = 1 + rand(s) * 1.5;
+  s.pickups.push({
+    id: s.nextId++,
+    kind,
+    map,
+    x,
+    y,
+    z: 0.2,
+    vx: Math.cos(a) * sp,
+    vy: Math.sin(a) * sp,
+    vz: 4.5,
+    life: C.PICKUP_LIFE,
+    value,
+  });
+}
+
+function rollDrop(s: GameState, map: MapId, x: number, y: number, rupeeChance: number, heartChance: number) {
+  const r = rand(s);
+  const hurt = s.player.hp < s.player.maxHp;
+  if (r < heartChance && hurt) spawnPickup(s, "heart", map, x, y);
+  else if (r < heartChance + rupeeChance) spawnPickup(s, "rupee", map, x, y, rand(s) < 0.15 ? 5 : 1);
+}
+
+// ───────────────────────────── player ─────────────────────────────
+function hurtPlayer(s: GameState, amount: number, fromX: number, fromY: number) {
+  const p = s.player;
+  if (p.invuln > 0 || s.phase !== "playing" || s.victoryT >= 0) return;
+  p.hp = Math.max(0, p.hp - amount);
+  p.invuln = C.INVULN_TIME;
+  p.knockT = 0.2;
+  let dx = p.x - fromX, dy = p.y - fromY;
+  const d = len(dx, dy) || 1;
+  dx /= d;
+  dy /= d;
+  p.vx = dx * 9;
+  p.vy = dy * 9;
+  p.swingT = 0;
+  p.hurtCount++;
+  emit(s, "hurt", p.map, p.x, p.y, dx, dy);
+  if (p.hp <= 0) {
+    s.phase = "gameover";
+    emit(s, "gameover", p.map, p.x, p.y);
+  }
+}
+
+function changeMap(s: GameState, map: MapId, x: number, y: number, fx: number, fy: number) {
+  const p = s.player;
+  p.map = map;
+  p.x = x;
+  p.y = y;
+  p.vx = p.vy = 0;
+  p.fx = fx;
+  p.fy = fy;
+  p.swingT = 0;
+  p.doorLock = true;
+  s.pickups = s.pickups.filter((k) => k.map === map);
+  s.transitionCount++;
+  emit(s, "door", map, x, y);
+}
+
+function updatePlayer(s: GameState, input: InputState, dt: number) {
+  const p = s.player;
+  p.invuln = Math.max(0, p.invuln - dt);
+  p.swingCd = Math.max(0, p.swingCd - dt);
+  if (p.swingT > 0) p.swingT = Math.max(0, p.swingT - dt);
+
+  let ix = (input.right ? 1 : 0) - (input.left ? 1 : 0);
+  let iy = (input.down ? 1 : 0) - (input.up ? 1 : 0);
+  const il = len(ix, iy);
+  if (il > 0) {
+    ix /= il;
+    iy /= il;
+  }
+
+  if (p.knockT > 0) {
+    p.knockT -= dt;
+    const f = Math.exp(-10 * dt);
+    p.vx *= f;
+    p.vy *= f;
+  } else {
+    const swinging = p.swingT > 0;
+    const max = C.PLAYER_MAX_SPEED * (swinging ? 0.45 : 1);
+    const tx = ix * max, ty = iy * max;
+    let dvx = tx - p.vx, dvy = ty - p.vy;
+    const dl = len(dvx, dvy);
+    const maxStep = (il > 0 ? C.PLAYER_ACCEL : C.PLAYER_DECEL) * dt;
+    if (dl > maxStep) {
+      dvx = (dvx / dl) * maxStep;
+      dvy = (dvy / dl) * maxStep;
+    }
+    p.vx += dvx;
+    p.vy += dvy;
+    if (il > 0 && !swinging) {
+      p.fx = ix;
+      p.fy = iy;
+    }
+  }
+
+  // attack
+  if (input.attack && p.swingCd <= 0 && p.knockT <= 0) {
+    p.swingT = C.SWING_TIME;
+    p.swingCd = C.SWING_COOLDOWN;
+    p.swingId++;
+    p.swingAngle = Math.atan2(p.fy, p.fx);
+    p.hitIds = [];
+    emit(s, "swing", p.map, p.x, p.y, p.fx, p.fy);
+  }
+
+  moveBody(s, p, p.vx * dt, p.vy * dt, C.PLAYER_R);
+  pushOutOfCircles(s, p, C.PLAYER_R, staticCircles(s, p.map));
+
+  if (p.swingT > 0) swordHits(s);
+
+  // doors
+  const tx = Math.floor(p.x), ty = Math.floor(p.y);
+  const onDoor = tileAt(MAPS[p.map], tx, ty) === Tile.DOOR;
+  if (!onDoor) p.doorLock = false;
+  else if (!p.doorLock) {
+    if (p.map === "over" && ty === OVER_DOOR.y) changeMap(s, "dungeon", DUNGEON_ENTRY.x, DUNGEON_ENTRY.y, 0, -1);
+    else if (p.map === "dungeon" && ty === DUNGEON_DOOR.y) changeMap(s, "over", OVER_DOOR_EXIT.x, OVER_DOOR_EXIT.y, 0, 1);
+  }
+
+  if (p.map === "dungeon") dungeonTriggers(s);
+}
+
+function swordHits(s: GameState) {
+  const p = s.player;
+  const a = p.swingAngle;
+  // the blade sweeps; the hit zone is a generous cone in front of the hero
+  for (const e of s.enemies) {
+    if (!e.alive || e.map !== p.map || p.hitIds.includes(e.id)) continue;
+    if (e.kind === "boss" && !s.flags.bossAwake) continue;
+    const dx = e.x - p.x, dy = e.y - p.y;
+    const d = len(dx, dy);
+    if (d - e.r > C.SWING_REACH) continue;
+    if (d > e.r + 0.15 && angleDiff(Math.atan2(dy, dx), a) > C.SWING_HALF_ARC) continue;
+    p.hitIds.push(e.id);
+    hitEnemy(s, e, Math.cos(a), Math.sin(a));
+  }
+  for (const b of s.breakables) {
+    if (!b.alive || b.map !== p.map || p.hitIds.includes(b.id)) continue;
+    const dx = b.x - p.x, dy = b.y - p.y;
+    const d = len(dx, dy);
+    if (d > C.SWING_REACH + 0.2) continue;
+    if (d > 0.4 && angleDiff(Math.atan2(dy, dx), a) > C.SWING_HALF_ARC) continue;
+    p.hitIds.push(b.id);
+    b.alive = false;
+    if (b.kind === "tuft") {
+      emit(s, "tuft", b.map, b.x, b.y);
+      rollDrop(s, b.map, b.x, b.y, 0.22, 0.12);
+    } else {
+      emit(s, "pot", b.map, b.x, b.y);
+      rollDrop(s, b.map, b.x, b.y, 0.55, 0.3);
+    }
+  }
+}
+
+function hitEnemy(s: GameState, e: Enemy, dx: number, dy: number) {
+  e.hp -= 1;
+  e.hitFlash = 0.14;
+  e.stun = e.kind === "boss" ? 0.22 : 0.32;
+  const kb = e.kind === "boss" ? 6 : 10;
+  e.vx = dx * kb;
+  e.vy = dy * kb;
+  if (e.kind === "boss" && (e.state === "windup" || e.state === "lunge")) {
+    e.state = "recover";
+    e.stateT = 0.4;
+  }
+  emit(s, "hit", e.map, e.x, e.y, dx, dy);
+  if (e.hp <= 0) killEnemy(s, e);
+}
+
+function killEnemy(s: GameState, e: Enemy) {
+  e.alive = false;
+  e.vx = e.vy = 0;
+  if (e.kind === "boss") {
+    s.flags.bossDefeated = true;
+    emit(s, "bossDie", e.map, e.x, e.y);
+    emit(s, "chestAppear", e.map, CHEST.x, CHEST.y);
+    spawnPickup(s, "heart", e.map, e.x, e.y);
+    spawnPickup(s, "heart", e.map, e.x, e.y);
+    for (let i = 0; i < 4; i++) spawnPickup(s, "rupee", e.map, e.x, e.y, 5);
+    say(s, "The Warden dissolves… a chest rises from the stone!", 3.2);
+  } else {
+    e.respawnT = C.BLOB_RESPAWN;
+    emit(s, "enemyDie", e.map, e.x, e.y);
+    spawnPickup(s, "rupee", e.map, e.x, e.y, rand(s) < 0.2 ? 5 : 1);
+  }
+}
+
+function dungeonTriggers(s: GameState) {
+  const p = s.player;
+  const f = s.flags;
+  if (!f.hasKey && len(p.x - PEDESTAL.x, p.y - PEDESTAL.y) < 0.95) {
+    f.hasKey = true;
+    emit(s, "key", "dungeon", PEDESTAL.x, PEDESTAL.y);
+    say(s, "You got the Mossgrave Key! The gate to the north awaits.");
+  }
+  if (!f.gateOpen) {
+    const gx = (GATE_X[0] + GATE_X[1] + 1) / 2;
+    const gy = GATE_ROW + 1;
+    if (Math.abs(p.x - gx) < 1.3 && p.y - gy < 0.6 && p.y > gy - 0.2) {
+      if (f.hasKey) {
+        f.gateOpen = true;
+        emit(s, "gate", "dungeon", gx, GATE_ROW + 0.5);
+        say(s, "The key turns. The gate grinds open…");
+      } else if (!s.message || s.message.t <= 0) {
+        say(s, "The gate is locked tight. There must be a key somewhere…", 2);
+      }
+    }
+  }
+  if (f.gateOpen && !f.bossAwake && !f.bossDefeated && p.y < BOSS_TRIGGER_Y) {
+    f.bossAwake = true;
+    emit(s, "gateSlam", "dungeon", 8, GATE_ROW + 0.5);
+    emit(s, "bossRoar", "dungeon", 8, 5);
+    say(s, "Gloomgulp, Warden of the Vault, awakens!", 2.4);
+  }
+  if (f.bossDefeated && !f.chestOpened && len(p.x - CHEST.x, p.y - CHEST.y) < 1.05) {
+    f.chestOpened = true;
+    s.victoryT = 2.2;
+    emit(s, "chest", "dungeon", CHEST.x, CHEST.y);
+    say(s, "You found the Hollow Sunstone!", 3);
+  }
+}
+
+// ───────────────────────────── enemies ─────────────────────────────
+function updateEnemies(s: GameState, dt: number) {
+  const p = s.player;
+  for (const e of s.enemies) {
+    if (!e.alive) {
+      if (e.kind === "blob") {
+        e.respawnT -= dt;
+        const far = p.map !== e.map || len(p.x - e.homeX, p.y - e.homeY) > 6;
+        if (e.respawnT <= 0 && far) {
+          e.alive = true;
+          e.hp = e.maxHp;
+          e.x = e.homeX;
+          e.y = e.homeY;
+          e.vx = e.vy = 0;
+          e.state = "idle";
+          e.stateT = 1;
+          emit(s, "spawn", e.map, e.x, e.y);
+        }
+      }
+      continue;
+    }
+    e.hitFlash = Math.max(0, e.hitFlash - dt);
+    e.contactCd = Math.max(0, e.contactCd - dt);
+    const samePlace = e.map === p.map;
+    const dx = p.x - e.x, dy = p.y - e.y;
+    const d = len(dx, dy);
+
+    if (e.stun > 0) {
+      e.stun -= dt;
+      const f = Math.exp(-9 * dt);
+      e.vx *= f;
+      e.vy *= f;
+    } else if (e.kind === "boss") {
+      updateBoss(s, e, dt, dx, dy, d);
+    } else {
+      const playerSafe = inSanctuary(p.map, p.x, p.y);
+      const aggro = samePlace && s.phase === "playing" && !playerSafe && d < C.BLOB_AGGRO;
+      let tx = 0, ty = 0;
+      if (aggro) {
+        e.state = "chase";
+        tx = (dx / d) * C.BLOB_SPEED;
+        ty = (dy / d) * C.BLOB_SPEED;
+      } else {
+        if (e.state === "chase") {
+          e.state = "idle";
+          e.stateT = 0.8;
+        }
+        e.stateT -= dt;
+        if (e.stateT <= 0) {
+          const hx = e.homeX - e.x, hy = e.homeY - e.y;
+          const hd = len(hx, hy);
+          if (hd > 3.5) {
+            e.state = "wander";
+            e.wx = hx / hd;
+            e.wy = hy / hd;
+          } else if (rand(s) < 0.4) {
+            e.state = "idle";
+          } else {
+            e.state = "wander";
+            const a = rand(s) * Math.PI * 2;
+            e.wx = Math.cos(a);
+            e.wy = Math.sin(a);
+          }
+          e.stateT = 0.9 + rand(s) * 1.6;
+        }
+        if (e.state === "wander") {
+          tx = e.wx * 1.0;
+          ty = e.wy * 1.0;
+        }
+      }
+      const k = Math.min(1, 8 * dt);
+      e.vx += (tx - e.vx) * k;
+      e.vy += (ty - e.vy) * k;
+    }
+
+    const blocked = moveBody(s, e, e.vx * dt, e.vy * dt, e.r * 0.85);
+    if (blocked.bx || blocked.by) {
+      if (e.state === "wander") e.stateT = 0;
+    }
+    pushOutOfCircles(s, e, e.r * 0.85, staticCircles(s, e.map));
+    // Sanctuary: enemies can never enter the spawn circle.
+    if (e.map === "over") {
+      const sx = e.x - SPAWN.x, sy = e.y - SPAWN.y;
+      const sd = len(sx, sy);
+      const min = C.SAFE_RADIUS + e.r;
+      if (sd < min) moveBody(s, e, (sx / (sd || 1)) * (min - sd), (sy / (sd || 1)) * (min - sd), e.r * 0.85);
+    }
+  }
+}
+
+function updateBoss(s: GameState, e: Enemy, dt: number, dx: number, dy: number, d: number) {
+  const f = s.flags;
+  if (!f.bossAwake) {
+    e.vx = e.vy = 0;
+    return;
+  }
+  e.stateT -= dt;
+  e.lungeCd -= dt;
+  const nx = dx / (d || 1), ny = dy / (d || 1);
+  let tx = 0, ty = 0;
+  switch (e.state) {
+    case "windup":
+      if (e.stateT <= 0) {
+        e.state = "lunge";
+        e.stateT = 0.42;
+        e.wx = nx;
+        e.wy = ny;
+        emit(s, "lunge", e.map, e.x, e.y, nx, ny);
+      }
+      break;
+    case "lunge":
+      tx = e.wx * 10;
+      ty = e.wy * 10;
+      if (e.stateT <= 0) {
+        e.state = "recover";
+        e.stateT = 0.55;
+      }
+      break;
+    case "recover":
+      if (e.stateT <= 0) e.state = "chase";
+      break;
+    default: {
+      e.state = "chase";
+      const enraged = e.hp <= e.maxHp / 2;
+      const sp = C.BOSS_SPEED * (enraged ? 1.2 : 1);
+      tx = nx * sp;
+      ty = ny * sp;
+      if (e.lungeCd <= 0 && d < 7 && d > 1.8) {
+        e.state = "windup";
+        e.stateT = enraged ? 0.4 : 0.6;
+        e.lungeCd = enraged ? 2.2 : 3.2;
+      }
+    }
+  }
+  const k = Math.min(1, (e.state === "lunge" ? 30 : 6) * dt);
+  e.vx += (tx - e.vx) * k;
+  e.vy += (ty - e.vy) * k;
+}
+
+/** Player and enemies are solid to each other; also handles contact damage. */
+function resolveBodies(s: GameState) {
+  const p = s.player;
+  const live = s.enemies.filter((e) => e.alive && e.map === p.map);
+  for (let iter = 0; iter < 3; iter++) {
+    // enemy ↔ enemy
+    for (let i = 0; i < live.length; i++)
+      for (let j = i + 1; j < live.length; j++) {
+        const a = live[i], b = live[j];
+        const dx = b.x - a.x, dy = b.y - a.y;
+        const d = len(dx, dy);
+        const min = a.r + b.r;
+        if (d < min) {
+          const nx = d > 1e-5 ? dx / d : 1, ny = d > 1e-5 ? dy / d : 0;
+          const push = (min - d) / 2 + 1e-3;
+          moveBody(s, a, -nx * push, -ny * push, a.r * 0.85);
+          moveBody(s, b, nx * push, ny * push, b.r * 0.85);
+        }
+      }
+    // player ↔ enemy
+    for (const e of live) {
+      const dx = p.x - e.x, dy = p.y - e.y;
+      const d = len(dx, dy);
+      const min = C.PLAYER_R + e.r;
+      if (d < min) {
+        const nx = d > 1e-5 ? dx / d : 0, ny = d > 1e-5 ? dy / d : 1;
+        const overlap = min - d + 1e-3;
+        const pShare = e.kind === "boss" ? 0.8 : 0.5;
+        const before = { x: p.x, y: p.y };
+        moveBody(s, p, nx * overlap * pShare, ny * overlap * pShare, C.PLAYER_R);
+        const moved = len(p.x - before.x, p.y - before.y);
+        moveBody(s, e, -nx * (overlap - moved), -ny * (overlap - moved), e.r * 0.85);
+      }
+    }
+  }
+  // contact damage
+  for (const e of live) {
+    if (e.kind === "boss" && !s.flags.bossAwake) continue;
+    const d = len(p.x - e.x, p.y - e.y);
+    if (d < C.PLAYER_R + e.r + 0.08 && e.contactCd <= 0 && e.stun <= 0 && p.invuln <= 0) {
+      e.contactCd = C.CONTACT_COOLDOWN;
+      hurtPlayer(s, e.kind === "boss" ? 2 : 1, e.x, e.y);
+    }
+  }
+}
+
+// ───────────────────────────── pickups ─────────────────────────────
+function updatePickups(s: GameState, dt: number) {
+  const p = s.player;
+  const keep: Pickup[] = [];
+  for (const k of s.pickups) {
+    k.life -= dt;
+    if (k.life <= 0) continue;
+    // little pop arc
+    if (k.z > 0 || k.vz > 0) {
+      k.vz -= 18 * dt;
+      k.z += k.vz * dt;
+      if (k.z <= 0) {
+        k.z = 0;
+        k.vz = Math.abs(k.vz) > 2 ? -k.vz * 0.35 : 0;
+      }
+    }
+    const dx = p.x - k.x, dy = p.y - k.y;
+    const d = len(dx, dy);
+    if (k.map === p.map && d < C.MAGNET_RADIUS && s.phase === "playing") {
+      const pull = 30 * (1 - d / C.MAGNET_RADIUS) + 6;
+      k.vx += (dx / (d || 1)) * pull * dt;
+      k.vy += (dy / (d || 1)) * pull * dt;
+    } else {
+      const f = Math.exp(-4 * dt);
+      k.vx *= f;
+      k.vy *= f;
+    }
+    moveBody(s, k, k.vx * dt, k.vy * dt, 0.15);
+    if (k.map === p.map && d < 0.5 && s.phase === "playing") {
+      if (k.kind === "rupee") {
+        p.rupees += k.value;
+        emit(s, "rupee", k.map, k.x, k.y);
+      } else {
+        p.hp = Math.min(p.maxHp, p.hp + 2);
+        emit(s, "heart", k.map, k.x, k.y);
+      }
+      continue;
+    }
+    keep.push(k);
+  }
+  s.pickups = keep;
+}
+
+// ───────────────────────────── main step ─────────────────────────────
+export function stepGame(s: GameState, input: InputState, dt = C.DT): GameState {
+  if (s.phase !== "playing") return s;
+  s.tick++;
+  if (!s.flags.chestOpened) s.time += dt;
+
+  if (s.victoryT >= 0) {
+    // The hero holds the treasure aloft; the world keeps breathing but the player can't act.
+    s.victoryT -= dt;
+    updatePickups(s, dt);
+    if (s.message) s.message.t -= dt;
+    if (s.victoryT <= 0) {
+      s.victoryT = 0;
+      s.phase = "victory";
+      emit(s, "victory", s.player.map, s.player.x, s.player.y);
+    }
+    return s;
+  }
+
+  updatePlayer(s, input, dt);
+  updateEnemies(s, dt);
+  resolveBodies(s);
+  updatePickups(s, dt);
+
+  if (s.message) {
+    s.message.t -= dt;
+    if (s.message.t <= 0) s.message = null;
+  }
+  s.area = areaName(s.player.map, s.player.x, s.player.y);
+  return s;
+}
+
+export function startGame(s: GameState): GameState {
+  s.phase = "playing";
+  say(s, "Find the Hollow Sunstone hidden beneath Cinderstone Crags. (WASD to move · Space to swing)", 4.5);
+  return s;
+}
